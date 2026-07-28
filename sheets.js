@@ -27,6 +27,37 @@
 //   node sheets.js metadata <spreadsheetId> [--grid]
 //   node sheets.js batchUpdate <spreadsheetId> <requestsJSON>          Sheets API batchUpdate requests 배열 그대로
 //
+// --- 시트(탭) 관리 ---
+//   node sheets.js addSheet <spreadsheetId> "새 시트 이름" [--index=N]
+//   node sheets.js deleteSheet <spreadsheetId> "시트이름"              ⚠️ 되돌릴 수 없음
+//   node sheets.js renameSheet <spreadsheetId> "기존이름" "새이름"
+//   node sheets.js duplicateSheet <spreadsheetId> "원본시트" [새이름] [--index=N]
+//   node sheets.js freeze <spreadsheetId> "SheetName" [고정행수] [고정열수]   예: freeze id Sheet1 1 0
+//
+// --- 행/열 편집 ---
+//   node sheets.js insertRows|insertCols <spreadsheetId> "SheetName" <기준번호> [개수=1] [--inheritBefore]
+//   node sheets.js deleteRows|deleteCols <spreadsheetId> "SheetName" <시작번호> [끝번호]   ⚠️ 되돌릴 수 없음
+//   node sheets.js sort <spreadsheetId> <range> <sortSpecJSON>          헤더 제외 범위. 예: '[{"col":"D","order":"DESC"}]'
+//
+// --- 데이터 품질/입력 보조 ---
+//   node sheets.js validate <spreadsheetId> <range> <valuesJSON> [--noStrict] [--noDropdown]  드롭다운 목록(데이터 확인)
+//   node sheets.js clearValidation <spreadsheetId> <range>
+//   node sheets.js findReplace <spreadsheetId> <"SheetName"|ALL> <찾을값> <바꿀값> [--matchCase] [--entireCell] [--regex]
+//   node sheets.js numberFormat <spreadsheetId> <range> <NUMBER|INTEGER|CURRENCY|PERCENT|DATE|TIME|DATE_TIME|SCIENTIFIC|커스텀패턴>
+//   node sheets.js note <spreadsheetId> <range> <메모내용>                셀 메모(note). ""로 주면 삭제
+//
+// --- 구조/보호/시각화 ---
+//   node sheets.js addNamedRange <spreadsheetId> <이름> <range>
+//   node sheets.js deleteNamedRange <spreadsheetId> <namedRangeId>
+//   node sheets.js protect <spreadsheetId> <range> [--description=] [--warningOnly] [--editors=a@x.com,b@x.com]
+//   node sheets.js addBanding <spreadsheetId> <range> [--firstColor=#hex] [--secondColor=#hex] [--headerColor=#hex]
+//   node sheets.js addChart <spreadsheetId> "SheetName" <COLUMN|LINE|BAR|AREA|SCATTER> <dataRange> [--title=] [--anchorCell=] [--width=] [--height=]
+//   node sheets.js setFilter <spreadsheetId> <range>                    기본 필터(드롭다운 화살표) 설정, 헤더 행 포함 범위
+//   node sheets.js clearFilter <spreadsheetId> "SheetName"
+//   node sheets.js splitText <spreadsheetId> <range> <구분자>            텍스트 나누기 (쉼표/탭/세미콜론/공백/커스텀)
+//   node sheets.js addPivot <spreadsheetId> <sourceRange> <대상시트> <앵커셀> <rowsJSON> <valuesJSON> [colsJSON]
+//                                                                        예: addPivot id "Sheet1!A1:F6" Sheet1 H1 '[{"col":"C"}]' '[{"col":"D","fn":"COUNTA"}]'
+//
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
 // 버그가 아닐 수 있다 — metadata로 bandedRanges 먼저 확인해볼 것.
@@ -284,6 +315,443 @@ async function mergeCells(sheets, spreadsheetId, rangeStrs, mergeType = "MERGE_A
   return res.data;
 }
 
+// ---------- 시트 관리: 추가/삭제/이름변경/복제 ----------
+
+function invalidateSheetIdCache(spreadsheetId) {
+  sheetIdCache.delete(spreadsheetId);
+}
+
+async function addSheet(sheets, spreadsheetId, title, index) {
+  const props = { title };
+  if (index !== undefined) props.index = index;
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests: [{ addSheet: { properties: props } }] },
+  });
+  invalidateSheetIdCache(spreadsheetId);
+  return res.data.replies[0].addSheet.properties;
+}
+
+async function deleteSheet(sheets, spreadsheetId, sheetName) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests: [{ deleteSheet: { sheetId } }] },
+  });
+  invalidateSheetIdCache(spreadsheetId);
+  return res.data;
+}
+
+async function renameSheet(sheets, spreadsheetId, oldName, newName) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, oldName);
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [
+        {
+          updateSheetProperties: {
+            properties: { sheetId, title: newName },
+            fields: "title",
+          },
+        },
+      ],
+    },
+  });
+  invalidateSheetIdCache(spreadsheetId);
+  return res.data;
+}
+
+async function duplicateSheet(sheets, spreadsheetId, sourceName, newName, index) {
+  const sourceSheetId = await getSheetId(sheets, spreadsheetId, sourceName);
+  const req = { duplicateSheet: { sourceSheetId } };
+  if (newName) req.duplicateSheet.newSheetName = newName;
+  if (index !== undefined) req.duplicateSheet.insertSheetIndex = index;
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests: [req] },
+  });
+  invalidateSheetIdCache(spreadsheetId);
+  return res.data.replies[0].duplicateSheet.properties;
+}
+
+async function setFrozen(sheets, spreadsheetId, sheetName, frozenRows, frozenCols) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const props = { sheetId, gridProperties: {} };
+  const fields = [];
+  if (frozenRows !== undefined) {
+    props.gridProperties.frozenRowCount = frozenRows;
+    fields.push("gridProperties.frozenRowCount");
+  }
+  if (frozenCols !== undefined) {
+    props.gridProperties.frozenColumnCount = frozenCols;
+    fields.push("gridProperties.frozenColumnCount");
+  }
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{ updateSheetProperties: { properties: props, fields: fields.join(",") } }],
+    },
+  });
+  return res.data;
+}
+
+// ---------- 행/열 삽입·삭제 ----------
+
+async function insertRowsOrCols(sheets, spreadsheetId, sheetName, dimension, beforeIndex1based, count, inheritBefore) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const startIndex = beforeIndex1based - 1;
+  const req = {
+    insertDimension: {
+      range: { sheetId, dimension, startIndex, endIndex: startIndex + count },
+      inheritFromBefore: !!inheritBefore,
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function deleteRowsOrCols(sheets, spreadsheetId, sheetName, dimension, start1based, end1based) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    deleteDimension: {
+      range: { sheetId, dimension, startIndex: start1based - 1, endIndex: end1based },
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 정렬 ----------
+
+// sortSpecs: [{col:"D", order:"ASC"|"DESC"}, ...]
+async function sortRange(sheets, spreadsheetId, rangeStr, sortSpecs) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("sort는 행 번호가 명시된 범위가 필요함 (예: Sheet1!A2:F6, 헤더 제외)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    sortRange: {
+      range: rangeToGridRange(sheetId, r),
+      sortSpecs: sortSpecs.map((s) => ({
+        dimensionIndex: colLetterToIndex(s.col),
+        sortOrder: (s.order || "ASC").toUpperCase() === "DESC" ? "DESCENDING" : "ASCENDING",
+      })),
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 데이터 검증 (드롭다운 등) ----------
+
+async function setValidation(sheets, spreadsheetId, rangeStr, listValues, opts = {}) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("validate는 행 번호가 명시된 범위가 필요함 (예: Sheet1!D2:D100)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    setDataValidation: {
+      range: rangeToGridRange(sheetId, r),
+      rule: {
+        condition: {
+          type: "ONE_OF_LIST",
+          values: listValues.map((v) => ({ userEnteredValue: v })),
+        },
+        strict: opts.strict !== false,
+        showCustomUi: opts.showDropdown !== false,
+      },
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function clearValidation(sheets, spreadsheetId, rangeStr) {
+  const r = parseRange(rangeStr);
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { setDataValidation: { range: rangeToGridRange(sheetId, r) } }; // rule 없으면 해제
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 이름 지정 범위 ----------
+
+async function addNamedRange(sheets, spreadsheetId, name, rangeStr) {
+  const r = parseRange(rangeStr);
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { addNamedRange: { namedRange: { name, range: rangeToGridRange(sheetId, r) } } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].addNamedRange.namedRange;
+}
+
+async function deleteNamedRange(sheets, spreadsheetId, namedRangeId) {
+  const req = { deleteNamedRange: { namedRangeId } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 찾기/바꾸기 ----------
+
+async function findReplace(sheets, spreadsheetId, sheetName, find, replacement, opts = {}) {
+  const req = {
+    findReplace: {
+      find,
+      replacement,
+      matchCase: !!opts.matchCase,
+      matchEntireCell: !!opts.entireCell,
+      searchByRegex: !!opts.regex,
+    },
+  };
+  if (sheetName && sheetName !== "ALL") {
+    req.findReplace.sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  } else {
+    req.findReplace.allSheets = true;
+  }
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].findReplace;
+}
+
+// ---------- 표시 형식(숫자/통화/퍼센트/날짜 등) ----------
+
+const NUMBER_FORMAT_PRESETS = {
+  NUMBER: "#,##0.##",
+  INTEGER: "#,##0",
+  CURRENCY: "₩#,##0",
+  PERCENT: "0.00%",
+  DATE: "yyyy-mm-dd",
+  TIME: "hh:mm:ss",
+  DATE_TIME: "yyyy-mm-dd hh:mm:ss",
+  SCIENTIFIC: "0.00E+00",
+};
+
+async function setNumberFormat(sheets, spreadsheetId, rangeStr, typeOrPattern) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("numberFormat은 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const pattern = NUMBER_FORMAT_PRESETS[typeOrPattern] || typeOrPattern;
+  const apiType = Object.keys(NUMBER_FORMAT_PRESETS).includes(typeOrPattern)
+    ? typeOrPattern.replace("INTEGER", "NUMBER").replace("DATE_TIME", "DATE_TIME")
+    : "NUMBER";
+  const req = {
+    repeatCell: {
+      range: rangeToGridRange(sheetId, r),
+      cell: { userEnteredFormat: { numberFormat: { type: apiType, pattern } } },
+      fields: "userEnteredFormat.numberFormat",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 셀 메모(note) ----------
+
+async function setNote(sheets, spreadsheetId, rangeStr, note) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("note는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    repeatCell: {
+      range: rangeToGridRange(sheetId, r),
+      cell: { note },
+      fields: "note",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 보호된 범위 ----------
+
+async function protectRange(sheets, spreadsheetId, rangeStr, opts = {}) {
+  const r = parseRange(rangeStr);
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const protectedRange = { range: rangeToGridRange(sheetId, r) };
+  if (opts.description) protectedRange.description = opts.description;
+  if (opts.warningOnly) protectedRange.warningOnly = true;
+  if (opts.editors && opts.editors.length) protectedRange.editors = { users: opts.editors };
+  const req = { addProtectedRange: { protectedRange } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].addProtectedRange.protectedRange;
+}
+
+// ---------- 줄무늬(밴딩) 서식 ----------
+
+function hexToRgb(hex) {
+  const h = hex.replace("#", "");
+  return {
+    red: parseInt(h.slice(0, 2), 16) / 255,
+    green: parseInt(h.slice(2, 4), 16) / 255,
+    blue: parseInt(h.slice(4, 6), 16) / 255,
+  };
+}
+
+async function addBanding(sheets, spreadsheetId, rangeStr, opts = {}) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("addBanding은 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const bandedRange = {
+    range: rangeToGridRange(sheetId, r),
+    rowProperties: {
+      firstBandColorStyle: { rgbColor: hexToRgb(opts.firstColor || "#FFFFFF") },
+      secondBandColorStyle: { rgbColor: hexToRgb(opts.secondColor || "#F3F3F3") },
+    },
+  };
+  if (opts.headerColor) {
+    bandedRange.rowProperties.headerColorStyle = { rgbColor: hexToRgb(opts.headerColor) };
+  }
+  const req = { addBanding: { bandedRange } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].addBanding.bandedRange;
+}
+
+// ---------- 차트 ----------
+
+async function addChart(sheets, spreadsheetId, sheetName, chartType, dataRangeStr, opts = {}) {
+  const dr = parseRange(dataRangeStr);
+  const sheetId = await getSheetId(sheets, spreadsheetId, dr.sheetName);
+  const domain = {
+    domain: {
+      sourceRange: {
+        sources: [
+          {
+            sheetId,
+            startRowIndex: dr.startRow - 1,
+            endRowIndex: dr.endRow,
+            startColumnIndex: dr.startCol,
+            endColumnIndex: dr.startCol + 1,
+          },
+        ],
+      },
+    },
+  };
+  const series = [
+    {
+      series: {
+        sourceRange: {
+          sources: [
+            {
+              sheetId,
+              startRowIndex: dr.startRow - 1,
+              endRowIndex: dr.endRow,
+              startColumnIndex: dr.startCol + 1,
+              endColumnIndex: dr.endCol + 1,
+            },
+          ],
+        },
+      },
+      targetAxis: "LEFT_AXIS",
+    },
+  ];
+  const chartSheetId = sheetId; // 앵커를 데이터가 있는 시트에 둠
+  const anchorCell = opts.anchorCell ? parseRange(`${sheetName}!${opts.anchorCell}`) : null;
+
+  const req = {
+    addChart: {
+      chart: {
+        spec: {
+          title: opts.title || "",
+          basicChart: {
+            chartType, // COLUMN, LINE, BAR, AREA, SCATTER
+            legendPosition: "BOTTOM_LEGEND",
+            axis: [{ position: "BOTTOM_AXIS" }, { position: "LEFT_AXIS" }],
+            domains: [domain],
+            series,
+            headerCount: 1,
+          },
+        },
+        position: {
+          overlayPosition: {
+            anchorCell: {
+              sheetId: chartSheetId,
+              rowIndex: anchorCell ? anchorCell.startRow - 1 : dr.endRow,
+              columnIndex: anchorCell ? anchorCell.startCol : dr.endCol + 2,
+            },
+            widthPixels: opts.width || 600,
+            heightPixels: opts.height || 350,
+          },
+        },
+      },
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].addChart.chart;
+}
+
+// ---------- 기본 필터 ----------
+
+async function setBasicFilter(sheets, spreadsheetId, rangeStr) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("filter는 행 번호가 명시된 범위가 필요함 (헤더 행 포함, 예: Sheet1!A1:F6)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { setBasicFilter: { filter: { range: rangeToGridRange(sheetId, r) } } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function clearBasicFilter(sheets, spreadsheetId, sheetName) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = { clearBasicFilter: { sheetId } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 텍스트 나누기 (구분자 기준 열 분리) ----------
+
+const DELIMITER_TYPES = { ",": "COMMA", "\t": "TAB", ";": "SEMICOLON", " ": "SPACE" };
+
+async function splitTextToColumns(sheets, spreadsheetId, rangeStr, delimiter) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("splitText는 행 번호가 명시된 범위가 필요함 (예: Sheet1!A2:A10)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const delimiterType = DELIMITER_TYPES[delimiter];
+  const req = {
+    textToColumns: {
+      source: rangeToGridRange(sheetId, r),
+      delimiterType: delimiterType || "CUSTOM",
+      ...(delimiterType ? {} : { delimiter }),
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 피벗 테이블 ----------
+
+// rowsSpec/valuesSpec: [{col:"B", label?:"..."}] / valuesSpec: [{col:"D", fn:"SUM"|"COUNTA"|"AVERAGE"|...}]
+async function addPivotTable(sheets, spreadsheetId, sourceRangeStr, anchorSheetName, anchorCellStr, rowsSpec, valuesSpec, colsSpec = []) {
+  const src = parseRange(sourceRangeStr);
+  if (!src.startRow || !src.endRow) fail("pivot 소스는 행 번호가 명시된 범위가 필요함 (헤더 포함)");
+  const srcSheetId = await getSheetId(sheets, spreadsheetId, src.sheetName);
+  const anchorSheetId = await getSheetId(sheets, spreadsheetId, anchorSheetName);
+  const anchor = parseRange(`${anchorSheetName}!${anchorCellStr}`);
+
+  const pivotTable = {
+    source: rangeToGridRange(srcSheetId, src),
+    rows: rowsSpec.map((s) => ({
+      sourceColumnOffset: colLetterToIndex(s.col) - src.startCol,
+      showTotals: true,
+      sortOrder: "ASCENDING",
+    })),
+    columns: colsSpec.map((s) => ({
+      sourceColumnOffset: colLetterToIndex(s.col) - src.startCol,
+      showTotals: true,
+      sortOrder: "ASCENDING",
+    })),
+    values: valuesSpec.map((s) => ({
+      sourceColumnOffset: colLetterToIndex(s.col) - src.startCol,
+      summarizeFunction: s.fn || "SUM",
+    })),
+  };
+
+  const req = {
+    updateCells: {
+      rows: [{ values: [{ pivotTable }] }],
+      start: { sheetId: anchorSheetId, rowIndex: anchor.startRow - 1, columnIndex: anchor.startCol },
+      fields: "pivotTable",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
 // ---------- ARRAYFORMULA 안전장치 ----------
 
 async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
@@ -386,18 +854,35 @@ async function main() {
   const mergeType = mergeTypeArg ? mergeTypeArg.split("=")[1] : "MERGE_ALL";
   const dimensionArg = rawArgs.find((a) => a.startsWith("--dimension="));
   const dimension = dimensionArg ? dimensionArg.split("=")[1] : "BOTH";
+  const indexArg = rawArgs.find((a) => a.startsWith("--index="));
+  const indexOpt = indexArg ? parseInt(indexArg.split("=")[1], 10) : undefined;
+  const inheritBefore = rawArgs.includes("--inheritBefore");
+  const strict = !rawArgs.includes("--noStrict");
+  const showDropdown = !rawArgs.includes("--noDropdown");
+  const matchCase = rawArgs.includes("--matchCase");
+  const entireCell = rawArgs.includes("--entireCell");
+  const regexFlag = rawArgs.includes("--regex");
+  const warningOnly = rawArgs.includes("--warningOnly");
+  const descArg = rawArgs.find((a) => a.startsWith("--description="));
+  const editorsArg = rawArgs.find((a) => a.startsWith("--editors="));
+  const titleArg = rawArgs.find((a) => a.startsWith("--title="));
+  const anchorCellArg = rawArgs.find((a) => a.startsWith("--anchorCell="));
+  const widthArg = rawArgs.find((a) => a.startsWith("--width="));
+  const heightArg = rawArgs.find((a) => a.startsWith("--height="));
+  const firstColorArg = rawArgs.find((a) => a.startsWith("--firstColor="));
+  const secondColorArg = rawArgs.find((a) => a.startsWith("--secondColor="));
+  const headerColorArg = rawArgs.find((a) => a.startsWith("--headerColor="));
+  const KNOWN_FLAGS = [
+    "--force", "--formulas", "--noFormat", "--inheritBefore", "--noStrict", "--noDropdown",
+    "--matchCase", "--entireCell", "--regex", "--warningOnly",
+  ];
+  const KNOWN_PREFIXES = [
+    "--formatFrom=", "--startCol=", "--mergeType=", "--dimension=", "--colWidth=", "--charWidth=",
+    "--lineHeight=", "--index=", "--description=", "--editors=", "--title=", "--anchorCell=",
+    "--width=", "--height=", "--firstColor=", "--secondColor=", "--headerColor=",
+  ];
   const args = rawArgs.filter(
-    (a) =>
-      a !== "--force" &&
-      a !== "--formulas" &&
-      a !== "--noFormat" &&
-      !a.startsWith("--formatFrom=") &&
-      !a.startsWith("--startCol=") &&
-      !a.startsWith("--mergeType=") &&
-      !a.startsWith("--dimension=") &&
-      !a.startsWith("--colWidth=") &&
-      !a.startsWith("--charWidth=") &&
-      !a.startsWith("--lineHeight=")
+    (a) => !KNOWN_FLAGS.includes(a) && !KNOWN_PREFIXES.some((p) => a.startsWith(p))
   );
   const [cmd, ...rest] = args;
   const sheets = getClient();
@@ -577,6 +1062,246 @@ async function main() {
       break;
     }
 
+    case "addSheet": {
+      const [spreadsheetId, title] = rest;
+      if (!spreadsheetId || !title) fail('사용법: addSheet <spreadsheetId> "새 시트 이름" [--index=N]');
+      const props = await addSheet(sheets, spreadsheetId, title, indexOpt);
+      printResult(props);
+      break;
+    }
+
+    case "deleteSheet": {
+      const [spreadsheetId, sheetName] = rest;
+      if (!spreadsheetId || !sheetName) fail('사용법: deleteSheet <spreadsheetId> "시트이름"  ⚠️ 되돌릴 수 없음');
+      const res = await deleteSheet(sheets, spreadsheetId, sheetName);
+      printResult(res);
+      break;
+    }
+
+    case "renameSheet": {
+      const [spreadsheetId, oldName, newName] = rest;
+      if (!spreadsheetId || !oldName || !newName) fail('사용법: renameSheet <spreadsheetId> "기존이름" "새이름"');
+      const res = await renameSheet(sheets, spreadsheetId, oldName, newName);
+      printResult(res);
+      break;
+    }
+
+    case "duplicateSheet": {
+      const [spreadsheetId, sourceName, newName] = rest;
+      if (!spreadsheetId || !sourceName) fail('사용법: duplicateSheet <spreadsheetId> "원본시트" [새이름] [--index=N]');
+      const props = await duplicateSheet(sheets, spreadsheetId, sourceName, newName, indexOpt);
+      printResult(props);
+      break;
+    }
+
+    case "freeze": {
+      const [spreadsheetId, sheetName, rowsStr, colsStr] = rest;
+      if (!spreadsheetId || !sheetName)
+        fail('사용법: freeze <spreadsheetId> "SheetName" [고정행수] [고정열수]  예: freeze id Sheet1 1 0');
+      const frozenRows = rowsStr !== undefined ? parseInt(rowsStr, 10) : undefined;
+      const frozenCols = colsStr !== undefined ? parseInt(colsStr, 10) : undefined;
+      const res = await setFrozen(sheets, spreadsheetId, sheetName, frozenRows, frozenCols);
+      printResult(res);
+      break;
+    }
+
+    case "insertRows":
+    case "insertCols": {
+      const [spreadsheetId, sheetName, beforeStr, countStr] = rest;
+      if (!spreadsheetId || !sheetName || !beforeStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <기준행/열번호(그 앞에 삽입)> [개수=1] [--inheritBefore]`);
+      const before = parseInt(beforeStr, 10);
+      const count = countStr ? parseInt(countStr, 10) : 1;
+      const dim = cmd === "insertRows" ? "ROWS" : "COLUMNS";
+      const res = await insertRowsOrCols(sheets, spreadsheetId, sheetName, dim, before, count, inheritBefore);
+      printResult(res);
+      break;
+    }
+
+    case "deleteRows":
+    case "deleteCols": {
+      const [spreadsheetId, sheetName, startStr, endStr] = rest;
+      if (!spreadsheetId || !sheetName || !startStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <시작번호> [끝번호=시작과동일]  ⚠️ 되돌릴 수 없음`);
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : start;
+      const dim = cmd === "deleteRows" ? "ROWS" : "COLUMNS";
+      const res = await deleteRowsOrCols(sheets, spreadsheetId, sheetName, dim, start, end);
+      printResult(res);
+      break;
+    }
+
+    case "sort": {
+      const [spreadsheetId, range, sortSpecJson] = rest;
+      if (!spreadsheetId || !range || !sortSpecJson)
+        fail(
+          '사용법: sort <spreadsheetId> "Sheet1!A2:F6" <sortSpecJSON>  헤더 제외한 범위. 예: \'[{"col":"D","order":"DESC"}]\''
+        );
+      const sortSpecs = JSON.parse(sortSpecJson);
+      const res = await sortRange(sheets, spreadsheetId, range, sortSpecs);
+      printResult(res);
+      break;
+    }
+
+    case "validate": {
+      const [spreadsheetId, range, listJson] = rest;
+      if (!spreadsheetId || !range || !listJson)
+        fail(
+          '사용법: validate <spreadsheetId> "Sheet1!D2:D100" <valuesJSON> [--noStrict] [--noDropdown]  예: validate id "Sheet1!D2:D100" \'["대기","진행중","완료"]\''
+        );
+      const listValues = JSON.parse(listJson);
+      const res = await setValidation(sheets, spreadsheetId, range, listValues, { strict, showDropdown });
+      printResult(res);
+      break;
+    }
+
+    case "clearValidation": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail('사용법: clearValidation <spreadsheetId> "Sheet1!D2:D100"');
+      const res = await clearValidation(sheets, spreadsheetId, range);
+      printResult(res);
+      break;
+    }
+
+    case "addNamedRange": {
+      const [spreadsheetId, name, range] = rest;
+      if (!spreadsheetId || !name || !range) fail('사용법: addNamedRange <spreadsheetId> <이름> "Sheet1!A1:F6"');
+      const res = await addNamedRange(sheets, spreadsheetId, name, range);
+      printResult(res);
+      break;
+    }
+
+    case "deleteNamedRange": {
+      const [spreadsheetId, namedRangeId] = rest;
+      if (!spreadsheetId || !namedRangeId)
+        fail("사용법: deleteNamedRange <spreadsheetId> <namedRangeId>  (id는 metadata로 확인)");
+      const res = await deleteNamedRange(sheets, spreadsheetId, namedRangeId);
+      printResult(res);
+      break;
+    }
+
+    case "findReplace": {
+      const [spreadsheetId, sheetName, find, replacement] = rest;
+      if (!spreadsheetId || !sheetName || find === undefined || replacement === undefined)
+        fail(
+          '사용법: findReplace <spreadsheetId> <"SheetName"|ALL> <찾을값> <바꿀값> [--matchCase] [--entireCell] [--regex]'
+        );
+      const res = await findReplace(sheets, spreadsheetId, sheetName, find, replacement, {
+        matchCase,
+        entireCell,
+        regex: regexFlag,
+      });
+      printResult(res);
+      break;
+    }
+
+    case "numberFormat": {
+      const [spreadsheetId, range, typeOrPattern] = rest;
+      if (!spreadsheetId || !range || !typeOrPattern)
+        fail(
+          '사용법: numberFormat <spreadsheetId> <range> <타입|패턴>  타입: NUMBER,INTEGER,CURRENCY,PERCENT,DATE,TIME,DATE_TIME,SCIENTIFIC  또는 커스텀 패턴(예: "0.0%")'
+        );
+      const res = await setNumberFormat(sheets, spreadsheetId, range, typeOrPattern);
+      printResult(res);
+      break;
+    }
+
+    case "note": {
+      const [spreadsheetId, range, ...noteParts] = rest;
+      if (!spreadsheetId || !range || noteParts.length === 0)
+        fail('사용법: note <spreadsheetId> <range> <메모내용>  빈 문자열("")로 주면 메모 삭제');
+      const res = await setNote(sheets, spreadsheetId, range, noteParts.join(" "));
+      printResult(res);
+      break;
+    }
+
+    case "protect": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range)
+        fail(
+          '사용법: protect <spreadsheetId> <range> [--description=설명] [--warningOnly] [--editors=email1,email2]  editors 안 주면 본인만 편집 가능'
+        );
+      const res = await protectRange(sheets, spreadsheetId, range, {
+        description: descArg ? descArg.split("=").slice(1).join("=") : undefined,
+        warningOnly,
+        editors: editorsArg ? editorsArg.split("=").slice(1).join("=").split(",") : undefined,
+      });
+      printResult(res);
+      break;
+    }
+
+    case "addBanding": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range)
+        fail(
+          '사용법: addBanding <spreadsheetId> <range> [--firstColor=#RRGGBB] [--secondColor=#RRGGBB] [--headerColor=#RRGGBB]'
+        );
+      const res = await addBanding(sheets, spreadsheetId, range, {
+        firstColor: firstColorArg ? firstColorArg.split("=")[1] : undefined,
+        secondColor: secondColorArg ? secondColorArg.split("=")[1] : undefined,
+        headerColor: headerColorArg ? headerColorArg.split("=")[1] : undefined,
+      });
+      printResult(res);
+      break;
+    }
+
+    case "addChart": {
+      const [spreadsheetId, sheetName, chartType, dataRange] = rest;
+      if (!spreadsheetId || !sheetName || !chartType || !dataRange)
+        fail(
+          '사용법: addChart <spreadsheetId> "SheetName" <COLUMN|LINE|BAR|AREA|SCATTER> "Sheet1!A1:B6" [--title=] [--anchorCell=D1] [--width=] [--height=]  ' +
+            "데이터 첫 열=X축(도메인), 나머지 열=시리즈. 헤더 행 포함해서 범위 지정할 것."
+        );
+      const res = await addChart(sheets, spreadsheetId, sheetName, chartType, dataRange, {
+        title: titleArg ? titleArg.split("=").slice(1).join("=") : undefined,
+        anchorCell: anchorCellArg ? anchorCellArg.split("=")[1] : undefined,
+        width: widthArg ? parseInt(widthArg.split("=")[1], 10) : undefined,
+        height: heightArg ? parseInt(heightArg.split("=")[1], 10) : undefined,
+      });
+      printResult(res);
+      break;
+    }
+
+    case "setFilter": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail('사용법: setFilter <spreadsheetId> "Sheet1!A1:F6"  (헤더 행 포함 범위)');
+      const res = await setBasicFilter(sheets, spreadsheetId, range);
+      printResult(res);
+      break;
+    }
+
+    case "clearFilter": {
+      const [spreadsheetId, sheetName] = rest;
+      if (!spreadsheetId || !sheetName) fail('사용법: clearFilter <spreadsheetId> "SheetName"');
+      const res = await clearBasicFilter(sheets, spreadsheetId, sheetName);
+      printResult(res);
+      break;
+    }
+
+    case "splitText": {
+      const [spreadsheetId, range, delimiter] = rest;
+      if (!spreadsheetId || !range || delimiter === undefined)
+        fail('사용법: splitText <spreadsheetId> "Sheet1!A2:A10" <구분자>  예: 쉼표는 ","  탭은 "\\t"');
+      const res = await splitTextToColumns(sheets, spreadsheetId, range, delimiter);
+      printResult(res);
+      break;
+    }
+
+    case "addPivot": {
+      const [spreadsheetId, sourceRange, anchorSheetName, anchorCell, rowsJson, valuesJson, colsJson] = rest;
+      if (!spreadsheetId || !sourceRange || !anchorSheetName || !anchorCell || !rowsJson || !valuesJson)
+        fail(
+          '사용법: addPivot <spreadsheetId> <sourceRange(헤더포함)> <대상시트> <앵커셀예:H1> <rowsJSON> <valuesJSON> [colsJSON]\n' +
+            '  예: addPivot id "Sheet1!A1:F6" Sheet1 H1 \'[{"col":"C"}]\' \'[{"col":"D","fn":"COUNTA"}]\''
+        );
+      const rowsSpec = JSON.parse(rowsJson);
+      const valuesSpec = JSON.parse(valuesJson);
+      const colsSpec = colsJson ? JSON.parse(colsJson) : [];
+      const res = await addPivotTable(sheets, spreadsheetId, sourceRange, anchorSheetName, anchorCell, rowsSpec, valuesSpec, colsSpec);
+      printResult(res);
+      break;
+    }
+
     case "clear": {
       const [spreadsheetId, range] = rest;
       if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
@@ -610,7 +1335,10 @@ async function main() {
 
     default:
       console.log(`알 수 없는 명령: ${cmd}
-사용 가능: tabs, get, batchGet, update, append, appendRow, copyFormat, merge, autoFit, setWidth, wrap, fitWrap, clear, metadata, batchUpdate
+사용 가능: tabs, get, batchGet, update, append, appendRow, copyFormat, merge, autoFit, setWidth, wrap, fitWrap,
+  addSheet, deleteSheet, renameSheet, duplicateSheet, freeze, insertRows, insertCols, deleteRows, deleteCols, sort,
+  validate, clearValidation, findReplace, numberFormat, note, addNamedRange, deleteNamedRange, protect, addBanding,
+  addChart, setFilter, clearFilter, splitText, addPivot, clear, metadata, batchUpdate
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }

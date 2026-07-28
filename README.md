@@ -50,6 +50,9 @@ node sheets.js metadata <spreadsheetId>
 
 # 서식/차트/병합 등 고급 조작 — Sheets API batchUpdate 요청을 그대로 전달
 node sheets.js batchUpdate <spreadsheetId> '[{"repeatCell":{...}}]'
+
+# 시트 추가/삭제/이름변경/복제, 행·열 삽입/삭제, 정렬, 드롭다운, 필터, 피벗, 차트 등
+# 전체 명령 목록은 sheets.js 맨 위 주석 또는 CLAUDE.md 참고 (24개 이상의 전용 명령 지원)
 ```
 
 `spreadsheetId`는 시트 URL 중간의 긴 문자열이다:
