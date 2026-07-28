@@ -59,6 +59,8 @@
 //                                                                        예: addPivot id "Sheet1!A1:F6" Sheet1 H1 '[{"col":"C"}]' '[{"col":"D","fn":"COUNTA"}]'
 //   node sheets.js condFormat <spreadsheetId> <range> <colorScale|formula> [--minColor=] [--midColor=] [--maxColor=] [--formula="=..."] [--backgroundColor=]
 //   node sheets.js copySheetTo <spreadsheetId> "SheetName" <대상spreadsheetId>   다른(또는 같은) 스프레드시트로 시트 복사
+//   node sheets.js renameSpreadsheet <spreadsheetId> "새 제목"           스프레드시트 파일 자체의 제목 변경
+//   node sheets.js setBorder <spreadsheetId> <range> <all|outer|inner|top,bottom,...> [--color=#000000] [--style=SOLID|DASHED|DOTTED|DOUBLE|SOLID_MEDIUM|SOLID_THICK]
 //
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
@@ -812,6 +814,42 @@ async function copySheetTo(sheets, spreadsheetId, sheetName, destSpreadsheetId) 
   return res.data;
 }
 
+// ---------- 스프레드시트 제목 변경 ----------
+
+async function renameSpreadsheet(sheets, spreadsheetId, newTitle) {
+  const req = { updateSpreadsheetProperties: { properties: { title: newTitle }, fields: "title" } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 테두리 ----------
+
+// sides: "all" | "outer" | "inner" | "top,bottom,left,right,innerH,innerV" 콤마 조합
+async function setBorder(sheets, spreadsheetId, rangeStr, sides, opts = {}) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("border는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const border = {
+    style: opts.style || "SOLID",
+    colorStyle: { rgbColor: hexToRgb(opts.color || "#000000") },
+  };
+  const wanted = new Set(
+    sides === "all"
+      ? ["top", "bottom", "left", "right", "innerHorizontal", "innerVertical"]
+      : sides === "outer"
+      ? ["top", "bottom", "left", "right"]
+      : sides === "inner"
+      ? ["innerHorizontal", "innerVertical"]
+      : sides.split(",").map((s) => s.trim())
+  );
+  const req = { updateBorders: { range: rangeToGridRange(sheetId, r) } };
+  for (const side of ["top", "bottom", "left", "right", "innerHorizontal", "innerVertical"]) {
+    if (wanted.has(side)) req.updateBorders[side] = border;
+  }
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
 // ---------- ARRAYFORMULA 안전장치 ----------
 
 async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
@@ -937,6 +975,8 @@ async function main() {
   const maxColorArg = rawArgs.find((a) => a.startsWith("--maxColor="));
   const formulaArg = rawArgs.find((a) => a.startsWith("--formula="));
   const backgroundColorArg = rawArgs.find((a) => a.startsWith("--backgroundColor="));
+  const colorArg = rawArgs.find((a) => a.startsWith("--color="));
+  const styleArg = rawArgs.find((a) => a.startsWith("--style="));
   const KNOWN_FLAGS = [
     "--force", "--formulas", "--noFormat", "--inheritBefore", "--noStrict", "--noDropdown",
     "--matchCase", "--entireCell", "--regex", "--warningOnly",
@@ -946,6 +986,7 @@ async function main() {
     "--lineHeight=", "--index=", "--description=", "--editors=", "--title=", "--anchorCell=",
     "--width=", "--height=", "--firstColor=", "--secondColor=", "--headerColor=",
     "--minColor=", "--midColor=", "--maxColor=", "--formula=", "--backgroundColor=",
+    "--color=", "--style=",
   ];
   const args = rawArgs.filter(
     (a) => !KNOWN_FLAGS.includes(a) && !KNOWN_PREFIXES.some((p) => a.startsWith(p))
@@ -1396,6 +1437,28 @@ async function main() {
       break;
     }
 
+    case "renameSpreadsheet": {
+      const [spreadsheetId, newTitle] = rest;
+      if (!spreadsheetId || !newTitle) fail('사용법: renameSpreadsheet <spreadsheetId> "새 제목"');
+      const res = await renameSpreadsheet(sheets, spreadsheetId, newTitle);
+      printResult(res);
+      break;
+    }
+
+    case "setBorder": {
+      const [spreadsheetId, range, sides] = rest;
+      if (!spreadsheetId || !range || !sides)
+        fail(
+          '사용법: setBorder <spreadsheetId> <range> <all|outer|inner|top,bottom,left,right,innerHorizontal,innerVertical> [--color=#000000] [--style=SOLID|DASHED|DOTTED|DOUBLE|SOLID_MEDIUM|SOLID_THICK]'
+        );
+      const res = await setBorder(sheets, spreadsheetId, range, sides, {
+        color: colorArg ? colorArg.split("=")[1] : undefined,
+        style: styleArg ? styleArg.split("=")[1] : undefined,
+      });
+      printResult(res);
+      break;
+    }
+
     case "clear": {
       const [spreadsheetId, range] = rest;
       if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
@@ -1432,7 +1495,8 @@ async function main() {
 사용 가능: tabs, get, batchGet, update, append, appendRow, copyFormat, merge, autoFit, setWidth, wrap, fitWrap,
   addSheet, deleteSheet, renameSheet, duplicateSheet, freeze, insertRows, insertCols, deleteRows, deleteCols, sort,
   validate, clearValidation, findReplace, numberFormat, note, addNamedRange, deleteNamedRange, protect, addBanding,
-  addChart, setFilter, clearFilter, splitText, addPivot, condFormat, copySheetTo, clear, metadata, batchUpdate
+  addChart, setFilter, clearFilter, splitText, addPivot, condFormat, copySheetTo, renameSpreadsheet, setBorder,
+  clear, metadata, batchUpdate
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }
