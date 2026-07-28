@@ -1,0 +1,621 @@
+#!/usr/bin/env node
+// Google Sheets 조작용 CLI. 값 읽기/쓰기부터 batchUpdate(서식/수식/차트/병합 등 고급 조작)까지.
+//
+// 사용법:
+//   node sheets.js tabs <spreadsheetId>                                시트(탭) 이름/ID 목록
+//   node sheets.js get <spreadsheetId> <range> [--formulas]            --formulas: 값 대신 수식 원문
+//   node sheets.js batchGet <spreadsheetId> <rangesJSON>                예: '["Sheet1!A1:B2","Sheet1!D1:D5"]'
+//   node sheets.js update <spreadsheetId> <range> <valuesJSON> [--force]
+//   node sheets.js append <spreadsheetId> <range> <valuesJSON> [--force]   (표 인식 방식, 위치가 예상과 다를 수 있음 — appendRow 권장)
+//   node sheets.js appendRow <spreadsheetId> "SheetName" <keyColLetter> <valuesJSON> [--formatFrom=행번호] [--startCol=열문자]
+//                                                                        keyColLetter 기준으로 실제 마지막 데이터 행 다음에 정확히 씀.
+//                                                                        --formatFrom=4 처럼 주면 그 행의 서식(정렬/폰트/배경 등)을 새 행에 복사.
+//                                                                        기본값: 바로 위 행(직전 데이터 행)에서 자동 복사.
+//                                                                        --startCol=C 처럼 주면 values를 A열이 아니라 C열부터 씀 (수식열 등을 건너뛸 때).
+//   node sheets.js copyFormat <spreadsheetId> <sourceRange> <destRange>   서식만 복사(값 안 건드림). 같은/다른 시트 다 가능
+//   node sheets.js merge <spreadsheetId> <rangesJSON> [--mergeType=MERGE_ALL|MERGE_COLUMNS|MERGE_ROWS]
+//                                                                        여러 범위를 한 번의 batchUpdate로 병합. 예: '["Sheet1!B1:D1","Sheet1!F1:I1"]'
+//   node sheets.js autoFit <spreadsheetId> <range> [--dimension=BOTH|COLUMNS|ROWS]
+//                                                                        열/행 경계 더블클릭한 것과 동일 — 셀 내용 길이에 맞춰 폭/높이 자동조정
+//   node sheets.js setWidth <spreadsheetId> <range> <pixels>            열 폭을 고정값으로 지정 (autoFit이 너무 넓게 잡았을 때)
+//   node sheets.js wrap <spreadsheetId> <range> [WRAP|CLIP|OVERFLOW_CELL]
+//                                                                        긴 텍스트를 옆으로 안 넓히고 셀 안에서 줄바꿈(세로로 길어짐). 기본 WRAP.
+//   node sheets.js fitWrap <spreadsheetId> <range> [--colWidth=260] [--charWidth=6] [--lineHeight=21]
+//                                                                        ⚠️ autoFit(ROWS)는 WRAP된 셀의 줄바꿈 높이를 못 잡음(실측 확인).
+//                                                                        글자수 기반으로 행 높이 직접 계산해서 적용. 순서: setWidth → wrap → fitWrap
+//   node sheets.js clear <spreadsheetId> <range>
+//   node sheets.js metadata <spreadsheetId> [--grid]
+//   node sheets.js batchUpdate <spreadsheetId> <requestsJSON>          Sheets API batchUpdate requests 배열 그대로
+//
+// 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
+// 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
+// 버그가 아닐 수 있다 — metadata로 bandedRanges 먼저 확인해볼 것.
+//
+// ⚠️ 안전장치: update/append/appendRow는 쓰기 전에 대상 범위가 걸쳐있는 "열"에
+// ARRAYFORMULA(자동 계산 열, 예: 순번)가 있는지 검사한다. 걸리면 기본적으로 거부하고,
+// 정말 그 열에 쓰고 싶으면 --force를 붙여야 한다. (겪은 사고: 자동 순번 열에 직접 값을
+// 써서 배열수식이 깨지고 #REF! 에러가 난 적 있음 — 그거 방지용)
+
+const fs = require("fs");
+const path = require("path");
+const { google } = require("googleapis");
+
+const CONFIG_PATH = path.join(__dirname, "config.json");
+const TOKEN_PATH = path.join(__dirname, "token.json");
+
+function fail(msg) {
+  console.error("오류:", msg);
+  process.exit(1);
+}
+
+function getClient() {
+  if (!fs.existsSync(CONFIG_PATH)) fail("config.json 없음 — config.example.json 참고해서 만들어주세요.");
+  if (!fs.existsSync(TOKEN_PATH)) fail("token.json 없음 — 먼저 `node auth.js` 실행해서 인증하세요.");
+
+  const { client_id, client_secret } = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  const tokens = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
+
+  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret);
+  oAuth2Client.setCredentials(tokens);
+
+  oAuth2Client.on("tokens", (newTokens) => {
+    const merged = { ...tokens, ...newTokens };
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify(merged, null, 2), { mode: 0o600 });
+  });
+
+  return google.sheets({ version: "v4", auth: oAuth2Client });
+}
+
+function printResult(dataOrObj) {
+  console.log(JSON.stringify(dataOrObj, null, 2));
+}
+
+// ---------- range / 열 문자 유틸 ----------
+
+function colLetterToIndex(letters) {
+  let n = 0;
+  for (const ch of letters.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1; // 0-based
+}
+
+function indexToColLetter(index) {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+// "SheetName!A5:C5" 또는 "'Sheet Name'!A1" 파싱
+function parseRange(range) {
+  const idx = range.lastIndexOf("!");
+  if (idx === -1) fail(`범위에 시트 이름이 없음: ${range} (예: "Sheet1!A1:C5")`);
+  let sheetName = range.slice(0, idx);
+  if (sheetName.startsWith("'") && sheetName.endsWith("'")) sheetName = sheetName.slice(1, -1);
+  const cellPart = range.slice(idx + 1);
+  const m = cellPart.match(/^([A-Za-z]+)(\d+)?(?::([A-Za-z]+)(\d+)?)?$/);
+  if (!m) fail(`범위 형식을 이해 못함: ${cellPart}`);
+  const [, colA, rowA, colB, rowB] = m;
+  return {
+    sheetName,
+    startCol: colLetterToIndex(colA),
+    startRow: rowA ? parseInt(rowA, 10) : null,
+    endCol: colB ? colLetterToIndex(colB) : colLetterToIndex(colA),
+    endRow: rowB ? parseInt(rowB, 10) : rowA ? parseInt(rowA, 10) : null,
+  };
+}
+
+function quoteSheetName(name) {
+  return /[^A-Za-z0-9_]/.test(name) ? `'${name}'` : name;
+}
+
+// ---------- 시트 이름 -> sheetId 조회 (batchUpdate용 GridRange 만들 때 필요) ----------
+
+const sheetIdCache = new Map(); // spreadsheetId -> Map(title -> sheetId)
+
+async function getSheetId(sheets, spreadsheetId, sheetName) {
+  if (!sheetIdCache.has(spreadsheetId)) {
+    const res = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets(properties(sheetId,title))",
+    });
+    const m = new Map(res.data.sheets.map((s) => [s.properties.title, s.properties.sheetId]));
+    sheetIdCache.set(spreadsheetId, m);
+  }
+  const m = sheetIdCache.get(spreadsheetId);
+  if (!m.has(sheetName)) fail(`시트 이름을 못 찾음: "${sheetName}" (실제 탭 이름과 정확히 일치해야 함, tabs 명령으로 확인)`);
+  return m.get(sheetName);
+}
+
+function rangeToGridRange(sheetId, r) {
+  return {
+    sheetId,
+    startRowIndex: r.startRow ? r.startRow - 1 : undefined,
+    endRowIndex: r.endRow ? r.endRow : undefined,
+    startColumnIndex: r.startCol,
+    endColumnIndex: r.endCol + 1,
+  };
+}
+
+async function copyFormat(sheets, spreadsheetId, sourceRangeStr, destRangeStr) {
+  const src = parseRange(sourceRangeStr);
+  const dst = parseRange(destRangeStr);
+  const srcSheetId = await getSheetId(sheets, spreadsheetId, src.sheetName);
+  const dstSheetId = await getSheetId(sheets, spreadsheetId, dst.sheetName);
+  if (!src.startRow || !src.endRow || !dst.startRow || !dst.endRow)
+    fail("copyFormat은 행 번호가 명시된 범위가 필요함 (예: Sheet1!A4:C4)");
+
+  const req = {
+    copyPaste: {
+      source: rangeToGridRange(srcSheetId, src),
+      destination: rangeToGridRange(dstSheetId, dst),
+      pasteType: "PASTE_FORMAT",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// 열 폭을 고정 픽셀값으로 지정 (autoFit이 너무 넓게 잡았을 때 등)
+async function setColumnWidth(sheets, spreadsheetId, rangeStr, pixelSize) {
+  const r = parseRange(rangeStr);
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    updateDimensionProperties: {
+      range: { sheetId, dimension: "COLUMNS", startIndex: r.startCol, endIndex: r.endCol + 1 },
+      properties: { pixelSize },
+      fields: "pixelSize",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// 긴 텍스트를 옆으로 넓히지 않고 셀 안에서 줄바꿈(세로로 길어지게) — WRAP/CLIP/OVERFLOW_CELL
+async function setWrap(sheets, spreadsheetId, rangeStr, strategy = "WRAP") {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("wrap은 행 번호가 명시된 범위가 필요함 (예: Sheet1!G1:G388)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    repeatCell: {
+      range: rangeToGridRange(sheetId, r),
+      cell: { userEnteredFormat: { wrapStrategy: strategy } },
+      fields: "userEnteredFormat.wrapStrategy",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ⚠️ autoFit(ROWS)는 WRAP된 셀의 실제 줄바꿈 높이를 계산 못 함(실측: 260px 폭에 141자 텍스트도 21px 그대로).
+// UI에서 행 경계 더블클릭하는 것과 달리 API의 autoResizeDimensions(ROWS)는 한 줄 기준으로만 계산하는 걸로 보임.
+// 그래서 WRAP 걸린 긴 텍스트 열은 이 함수로 글자수 기반 추정 높이를 직접 지정해야 함.
+async function fitWrapRowHeights(sheets, spreadsheetId, rangeStr, opts = {}) {
+  const { colWidth = 260, charWidth = 6, lineHeight = 21, padding = 8 } = opts;
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("fitWrap은 행 번호가 명시된 범위가 필요함 (예: Sheet1!G1:G388)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const charsPerLine = Math.max(1, Math.floor((colWidth - padding) / charWidth));
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: rangeStr,
+  });
+  const values = res.data.values || [];
+
+  const requests = [];
+  values.forEach((row, i) => {
+    const text = row[0] || "";
+    if (!text) return;
+    const lines = Math.max(1, Math.ceil(text.length / charsPerLine));
+    if (lines <= 1) return; // 기본 한 줄 높이면 건드릴 필요 없음
+    const rowIndex0 = r.startRow - 1 + i;
+    requests.push({
+      updateDimensionProperties: {
+        range: { sheetId, dimension: "ROWS", startIndex: rowIndex0, endIndex: rowIndex0 + 1 },
+        properties: { pixelSize: lines * lineHeight },
+        fields: "pixelSize",
+      },
+    });
+  });
+
+  if (!requests.length) return { adjustedRows: 0 };
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
+  return { adjustedRows: requests.length, charsPerLine };
+}
+
+async function autoFit(sheets, spreadsheetId, rangeStr, dimension = "BOTH") {
+  const r = parseRange(rangeStr);
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const requests = [];
+  const wantCols = dimension === "BOTH" || dimension === "COLUMNS";
+  const wantRows = dimension === "BOTH" || dimension === "ROWS";
+
+  if (wantCols) {
+    requests.push({
+      autoResizeDimensions: {
+        dimensions: {
+          sheetId,
+          dimension: "COLUMNS",
+          startIndex: r.startCol,
+          endIndex: r.endCol + 1,
+        },
+      },
+    });
+  }
+  if (wantRows) {
+    if (dimension === "ROWS" && !r.startRow)
+      fail('행 자동맞춤은 행 번호가 있는 범위가 필요함 (예: Sheet1!A1:I388) — 열만 원하면 --dimension=COLUMNS');
+    if (r.startRow && r.endRow) {
+      requests.push({
+        autoResizeDimensions: {
+          dimensions: {
+            sheetId,
+            dimension: "ROWS",
+            startIndex: r.startRow - 1,
+            endIndex: r.endRow,
+          },
+        },
+      });
+    }
+  }
+  if (!requests.length) fail("autoFit: 적용할 범위가 없음 (열/행 범위를 확인)");
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
+  return res.data;
+}
+
+async function mergeCells(sheets, spreadsheetId, rangeStrs, mergeType = "MERGE_ALL") {
+  const requests = [];
+  for (const rangeStr of rangeStrs) {
+    const r = parseRange(rangeStr);
+    if (!r.startRow || !r.endRow) fail(`merge는 행 번호가 명시된 범위가 필요함 (예: Sheet1!B4:D4) — 받은 값: "${rangeStr}"`);
+    const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+    requests.push({
+      mergeCells: {
+        range: rangeToGridRange(sheetId, r),
+        mergeType,
+      },
+    });
+  }
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
+  return res.data;
+}
+
+// ---------- ARRAYFORMULA 안전장치 ----------
+
+async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${quoteSheetName(sheetName)}!A1:ZZ2000`,
+    valueRenderOption: "FORMULA",
+  });
+  const rows = res.data.values || [];
+  const cols = new Map(); // colIndex -> {row, formula}
+  rows.forEach((row, rowIdx) => {
+    row.forEach((cell, colIdx) => {
+      if (typeof cell === "string" && /ARRAYFORMULA/i.test(cell) && !cols.has(colIdx)) {
+        cols.set(colIdx, { row: rowIdx + 1, formula: cell });
+      }
+    });
+  });
+  return cols;
+}
+
+async function guardArrayFormulaCollision(sheets, spreadsheetId, range, force) {
+  const { sheetName, startCol, endCol, startRow } = parseRange(range);
+  const formulaCols = await findArrayFormulaColumns(sheets, spreadsheetId, sheetName);
+  if (formulaCols.size === 0) return;
+
+  const hit = [];
+  for (let c = startCol; c <= endCol; c++) {
+    if (formulaCols.has(c) && (!startRow || startRow > formulaCols.get(c).row)) {
+      hit.push({ col: indexToColLetter(c), ...formulaCols.get(c) });
+    }
+  }
+  if (hit.length === 0) return;
+
+  const detail = hit
+    .map((h) => `  ${h.col}열 (${h.row}행에 ${h.formula.slice(0, 60)}${h.formula.length > 60 ? "..." : ""})`)
+    .join("\n");
+
+  if (!force) {
+    fail(
+      `이 범위가 자동계산(ARRAYFORMULA) 열과 겹쳐요. 직접 쓰면 수식이 깨질 수 있어요:\n${detail}\n` +
+        `정말 이 열에 값을 쓰고 싶으면 명령 끝에 --force를 붙이세요. 아니면 다른 열만 써서 쓰기 범위를 좁히세요.`
+    );
+  } else {
+    console.error(`⚠️  경고: --force로 자동계산 열에 직접 씁니다. 아래 열의 수식이 깨질 수 있어요:\n${detail}`);
+  }
+}
+
+// ---------- appendRow: 실제 마지막 데이터 행을 스캔해서 정확한 위치에 쓰기 ----------
+
+async function appendRowSafe(sheets, spreadsheetId, sheetName, keyColLetter, values, force, formatFrom, startColLetter = "A") {
+  const keyColIdx = colLetterToIndex(keyColLetter);
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${quoteSheetName(sheetName)}!${keyColLetter}1:${keyColLetter}2000`,
+  });
+  const colValues = res.data.values || [];
+  let lastRow = 0;
+  colValues.forEach((row, i) => {
+    if (row[0] !== undefined && row[0] !== "") lastRow = i + 1;
+  });
+  const targetRow = lastRow + 1;
+  const startColIdx = colLetterToIndex(startColLetter);
+  const endColLetter = indexToColLetter(startColIdx + values[0].length - 1);
+  const range = `${quoteSheetName(sheetName)}!${startColLetter}${targetRow}:${endColLetter}${targetRow}`;
+
+  await guardArrayFormulaCollision(sheets, spreadsheetId, range, force);
+
+  const writeRes = await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values },
+  });
+
+  let formatCopied = null;
+  // formatFrom이 명시적으로 false가 아니면(기본 동작) 서식을 복사한다.
+  // formatFrom이 숫자면 그 행에서, 안 주면 바로 위(직전 데이터) 행에서 복사.
+  if (formatFrom !== false && lastRow > 0) {
+    const sourceRow = typeof formatFrom === "number" ? formatFrom : lastRow;
+    const sourceRange = `${quoteSheetName(sheetName)}!${startColLetter}${sourceRow}:${endColLetter}${sourceRow}`;
+    await copyFormat(sheets, spreadsheetId, sourceRange, range);
+    formatCopied = sourceRow;
+  }
+
+  return { targetRow, range, result: writeRes.data, formatCopiedFromRow: formatCopied };
+}
+
+// ---------- main ----------
+
+async function main() {
+  const rawArgs = process.argv.slice(2);
+  const force = rawArgs.includes("--force");
+  const formulas = rawArgs.includes("--formulas");
+  const noFormat = rawArgs.includes("--noFormat");
+  const formatFromArg = rawArgs.find((a) => a.startsWith("--formatFrom="));
+  const formatFrom = noFormat ? false : formatFromArg ? parseInt(formatFromArg.split("=")[1], 10) : undefined;
+  const startColArg = rawArgs.find((a) => a.startsWith("--startCol="));
+  const startCol = startColArg ? startColArg.split("=")[1] : "A";
+  const mergeTypeArg = rawArgs.find((a) => a.startsWith("--mergeType="));
+  const mergeType = mergeTypeArg ? mergeTypeArg.split("=")[1] : "MERGE_ALL";
+  const dimensionArg = rawArgs.find((a) => a.startsWith("--dimension="));
+  const dimension = dimensionArg ? dimensionArg.split("=")[1] : "BOTH";
+  const args = rawArgs.filter(
+    (a) =>
+      a !== "--force" &&
+      a !== "--formulas" &&
+      a !== "--noFormat" &&
+      !a.startsWith("--formatFrom=") &&
+      !a.startsWith("--startCol=") &&
+      !a.startsWith("--mergeType=") &&
+      !a.startsWith("--dimension=") &&
+      !a.startsWith("--colWidth=") &&
+      !a.startsWith("--charWidth=") &&
+      !a.startsWith("--lineHeight=")
+  );
+  const [cmd, ...rest] = args;
+  const sheets = getClient();
+
+  switch (cmd) {
+    case "tabs": {
+      const [spreadsheetId] = rest;
+      if (!spreadsheetId) fail("사용법: tabs <spreadsheetId>");
+      const res = await sheets.spreadsheets.get({ spreadsheetId });
+      const list = res.data.sheets.map((s) => ({
+        sheetId: s.properties.sheetId,
+        title: s.properties.title,
+        rows: s.properties.gridProperties?.rowCount,
+        cols: s.properties.gridProperties?.columnCount,
+      }));
+      printResult(list);
+      break;
+    }
+
+    case "get": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail("사용법: get <spreadsheetId> <range> [--formulas]");
+      const res = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range,
+        valueRenderOption: formulas ? "FORMULA" : "FORMATTED_VALUE",
+      });
+      printResult(res.data);
+      break;
+    }
+
+    case "batchGet": {
+      const [spreadsheetId, rangesJson] = rest;
+      if (!spreadsheetId || !rangesJson) fail("사용법: batchGet <spreadsheetId> <rangesJSON>");
+      const ranges = JSON.parse(rangesJson);
+      const res = await sheets.spreadsheets.values.batchGet({
+        spreadsheetId,
+        ranges,
+        valueRenderOption: formulas ? "FORMULA" : "FORMATTED_VALUE",
+      });
+      printResult(res.data);
+      break;
+    }
+
+    case "update": {
+      const [spreadsheetId, range, valuesJson] = rest;
+      if (!spreadsheetId || !range || !valuesJson) fail("사용법: update <spreadsheetId> <range> <valuesJSON> [--force]");
+      const values = JSON.parse(valuesJson);
+      await guardArrayFormulaCollision(sheets, spreadsheetId, range, force);
+      const res = await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values },
+      });
+      printResult(res.data);
+      break;
+    }
+
+    case "append": {
+      const [spreadsheetId, range, valuesJson] = rest;
+      if (!spreadsheetId || !range || !valuesJson) fail("사용법: append <spreadsheetId> <range> <valuesJSON> [--force]");
+      console.error("참고: append는 Sheets API의 '표 인식' 방식이라 빈 칸이 섞여 있으면 예상 밖 위치에 써질 수 있어요. 정확한 위치가 중요하면 appendRow를 쓰세요.");
+      const values = JSON.parse(valuesJson);
+      await guardArrayFormulaCollision(sheets, spreadsheetId, range, force);
+      const res = await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values },
+      });
+      printResult(res.data);
+      break;
+    }
+
+    case "appendRow": {
+      const [spreadsheetId, sheetName, keyColLetter, valuesJson] = rest;
+      if (!spreadsheetId || !sheetName || !keyColLetter || !valuesJson)
+        fail(
+          '사용법: appendRow <spreadsheetId> "SheetName" <키열문자예:C> <valuesJSON — 2차원, 1행> [--force] [--formatFrom=행번호] [--noFormat] [--startCol=열문자]'
+        );
+      const values = JSON.parse(valuesJson);
+      if (!Array.isArray(values) || !Array.isArray(values[0]))
+        fail("valuesJSON은 2차원 배열이어야 함, 예: [[\"a\",\"b\",\"c\"]]");
+      const out = await appendRowSafe(
+        sheets,
+        spreadsheetId,
+        sheetName,
+        keyColLetter,
+        values,
+        force,
+        formatFrom,
+        startCol
+      );
+      console.error(
+        `→ ${out.targetRow}행에 씀 (${out.range})` +
+          (out.formatCopiedFromRow ? `, 서식은 ${out.formatCopiedFromRow}행에서 복사함` : ", 서식 복사 안 함")
+      );
+      printResult(out.result);
+      break;
+    }
+
+    case "copyFormat": {
+      const [spreadsheetId, sourceRange, destRange] = rest;
+      if (!spreadsheetId || !sourceRange || !destRange)
+        fail('사용법: copyFormat <spreadsheetId> "Sheet1!A4:C4" "Sheet1!A5:C5"  (값은 안 바뀌고 서식만 복사됨)');
+      const res = await copyFormat(sheets, spreadsheetId, sourceRange, destRange);
+      printResult(res);
+      break;
+    }
+
+    case "merge": {
+      const [spreadsheetId, rangesJson] = rest;
+      if (!spreadsheetId || !rangesJson)
+        fail(
+          '사용법: merge <spreadsheetId> <rangesJSON> [--mergeType=MERGE_ALL|MERGE_COLUMNS|MERGE_ROWS]  예: merge id \'["Sheet1!B1:D1","Sheet1!F1:I1"]\''
+        );
+      let rangeList;
+      try {
+        rangeList = JSON.parse(rangesJson);
+      } catch {
+        fail('rangesJSON 파싱 실패 — 예: \'["Sheet1!B1:D1","Sheet1!F1:I1"]\'');
+      }
+      if (!Array.isArray(rangeList)) fail("rangesJSON은 문자열 배열이어야 함");
+      const res = await mergeCells(sheets, spreadsheetId, rangeList, mergeType);
+      printResult(res);
+      break;
+    }
+
+    case "autoFit": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range)
+        fail(
+          '사용법: autoFit <spreadsheetId> "Sheet1!A1:I388" [--dimension=BOTH|COLUMNS|ROWS]  열/행 경계 더블클릭한 것과 동일 (내용 길이에 맞춰 자동조정)'
+        );
+      const res = await autoFit(sheets, spreadsheetId, range, dimension);
+      printResult(res);
+      break;
+    }
+
+    case "setWidth": {
+      const [spreadsheetId, range, pixelsStr] = rest;
+      if (!spreadsheetId || !range || !pixelsStr)
+        fail('사용법: setWidth <spreadsheetId> "Sheet1!G:G" <pixels>  예: setWidth id "Sheet1!G:G" 260');
+      const pixels = parseInt(pixelsStr, 10);
+      if (Number.isNaN(pixels)) fail("pixels는 숫자여야 함");
+      const res = await setColumnWidth(sheets, spreadsheetId, range, pixels);
+      printResult(res);
+      break;
+    }
+
+    case "wrap": {
+      const [spreadsheetId, range, strategy] = rest;
+      if (!spreadsheetId || !range)
+        fail('사용법: wrap <spreadsheetId> "Sheet1!G1:G388" [WRAP|CLIP|OVERFLOW_CELL]  기본 WRAP (셀 안에서 줄바꿈, 세로로 길어짐)');
+      const res = await setWrap(sheets, spreadsheetId, range, strategy || "WRAP");
+      printResult(res);
+      break;
+    }
+
+    case "fitWrap": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range)
+        fail(
+          '사용법: fitWrap <spreadsheetId> "Sheet1!G1:G388" [--colWidth=260] [--charWidth=6] [--lineHeight=21]  ' +
+            "autoFit(ROWS)가 WRAP 높이를 못 잡을 때 글자수 기반으로 행 높이 직접 계산/적용 (wrap 명령을 먼저 걸어둘 것)"
+        );
+      const colWidthArg = rawArgs.find((a) => a.startsWith("--colWidth="));
+      const charWidthArg = rawArgs.find((a) => a.startsWith("--charWidth="));
+      const lineHeightArg = rawArgs.find((a) => a.startsWith("--lineHeight="));
+      const opts = {};
+      if (colWidthArg) opts.colWidth = parseInt(colWidthArg.split("=")[1], 10);
+      if (charWidthArg) opts.charWidth = parseInt(charWidthArg.split("=")[1], 10);
+      if (lineHeightArg) opts.lineHeight = parseInt(lineHeightArg.split("=")[1], 10);
+      const res = await fitWrapRowHeights(sheets, spreadsheetId, range, opts);
+      printResult(res);
+      break;
+    }
+
+    case "clear": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
+      const res = await sheets.spreadsheets.values.clear({ spreadsheetId, range });
+      printResult(res.data);
+      break;
+    }
+
+    case "metadata": {
+      const [spreadsheetId, flag] = rest;
+      if (!spreadsheetId) fail("사용법: metadata <spreadsheetId> [--grid]");
+      const res = await sheets.spreadsheets.get({
+        spreadsheetId,
+        includeGridData: flag === "--grid",
+      });
+      printResult(res.data);
+      break;
+    }
+
+    case "batchUpdate": {
+      const [spreadsheetId, requestsJson] = rest;
+      if (!spreadsheetId || !requestsJson) fail("사용법: batchUpdate <spreadsheetId> <requestsJSON>");
+      const requests = JSON.parse(requestsJson);
+      const res = await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests },
+      });
+      printResult(res.data);
+      break;
+    }
+
+    default:
+      console.log(`알 수 없는 명령: ${cmd}
+사용 가능: tabs, get, batchGet, update, append, appendRow, copyFormat, merge, autoFit, setWidth, wrap, fitWrap, clear, metadata, batchUpdate
+자세한 사용법은 sheets.js 상단 주석 참고.`);
+      process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  fail(err.response?.data ? JSON.stringify(err.response.data) : err.message);
+});
