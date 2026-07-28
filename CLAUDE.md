@@ -130,6 +130,14 @@ Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1�
 안 걸렸던 것 — 2열 이하에서만 우연히 동작하던 잠복 버그). 여러 시리즈(막대 여러 개, 선 여러 개)
 차트를 만들 때 특히 중요.
 
+### 19. `appendRow`는 이제 API 호출 1번으로 줄임 (원래 2번이었음)
+`appendRowSafe`가 "키 열의 마지막 데이터 행 찾기"용으로 별도 `values.get`을 하고, 그 안에서 호출하는
+`guardArrayFormulaCollision`이 ARRAYFORMULA 검사용으로 시트 전체(A1:ZZ2000, FORMULA 렌더링)를 또
+`values.get`했다 — 그런데 후자가 이미 전자가 필요로 하는 열 데이터를 포함하는 상위집합이라 합칠 수
+있었다. `scanSheetFormulaRows()`로 한 번만 긁어서 `lastRow` 계산과 ARRAYFORMULA 충돌 검사 둘 다에
+재사용하도록 리팩터링. ARRAYFORMULA 가드가 걸리는 케이스/안 걸리는 케이스/`--startCol`로 우회하는
+케이스 전부 재검증해서 동작 동일함 확인.
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`

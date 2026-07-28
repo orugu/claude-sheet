@@ -1292,13 +1292,20 @@ async function setSpreadsheetLocale(sheets, spreadsheetId, locale, timeZone) {
 
 // ---------- ARRAYFORMULA 안전장치 ----------
 
-async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
+// 시트 전체를 FORMULA 렌더링으로 한 번 긁어옴 — appendRowSafe가 "마지막 데이터 행 찾기"에도
+// 이 결과를 재사용해서(같은 열의 데이터가 이미 여기 들어있음) 별도로 다시 fetch하지 않는다.
+// (최적화: appendRow 한 번에 API 호출 2번 하던 걸 1번으로 줄임 — 예전엔 키열 스캔 fetch와
+// ARRAYFORMULA 전체 스캔 fetch가 따로였는데, 후자가 전자를 포함하는 상위집합이라 합칠 수 있었음.)
+async function scanSheetFormulaRows(sheets, spreadsheetId, sheetName) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `${quoteSheetName(sheetName)}!A1:ZZ2000`,
     valueRenderOption: "FORMULA",
   });
-  const rows = res.data.values || [];
+  return res.data.values || [];
+}
+
+function findArrayFormulaColumnsInRows(rows) {
   const cols = new Map(); // colIndex -> {row, formula}
   rows.forEach((row, rowIdx) => {
     row.forEach((cell, colIdx) => {
@@ -1310,9 +1317,11 @@ async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
   return cols;
 }
 
-async function guardArrayFormulaCollision(sheets, spreadsheetId, range, force) {
+// rows를 미리 넘기면(appendRowSafe처럼 이미 스캔해둔 게 있으면) 재사용, 없으면 새로 fetch
+async function guardArrayFormulaCollision(sheets, spreadsheetId, range, force, preScannedRows) {
   const { sheetName, startCol, endCol, startRow } = parseRange(range);
-  const formulaCols = await findArrayFormulaColumns(sheets, spreadsheetId, sheetName);
+  const rows = preScannedRows || (await scanSheetFormulaRows(sheets, spreadsheetId, sheetName));
+  const formulaCols = findArrayFormulaColumnsInRows(rows);
   if (formulaCols.size === 0) return;
 
   const hit = [];
@@ -1340,21 +1349,19 @@ async function guardArrayFormulaCollision(sheets, spreadsheetId, range, force) {
 // ---------- appendRow: 실제 마지막 데이터 행을 스캔해서 정확한 위치에 쓰기 ----------
 
 async function appendRowSafe(sheets, spreadsheetId, sheetName, keyColLetter, values, force, formatFrom, startColLetter = "A") {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${quoteSheetName(sheetName)}!${keyColLetter}1:${keyColLetter}2000`,
-  });
-  const colValues = res.data.values || [];
+  const keyColIdx = colLetterToIndex(keyColLetter);
+  const scannedRows = await scanSheetFormulaRows(sheets, spreadsheetId, sheetName);
   let lastRow = 0;
-  colValues.forEach((row, i) => {
-    if (row[0] !== undefined && row[0] !== "") lastRow = i + 1;
+  scannedRows.forEach((row, i) => {
+    const cell = row[keyColIdx];
+    if (cell !== undefined && cell !== "") lastRow = i + 1;
   });
   const targetRow = lastRow + 1;
   const startColIdx = colLetterToIndex(startColLetter);
   const endColLetter = indexToColLetter(startColIdx + values[0].length - 1);
   const range = `${quoteSheetName(sheetName)}!${startColLetter}${targetRow}:${endColLetter}${targetRow}`;
 
-  await guardArrayFormulaCollision(sheets, spreadsheetId, range, force);
+  await guardArrayFormulaCollision(sheets, spreadsheetId, range, force, scannedRows);
 
   const writeRes = await sheets.spreadsheets.values.update({
     spreadsheetId,
