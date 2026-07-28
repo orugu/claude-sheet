@@ -115,6 +115,12 @@ Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1�
 드래그해야 패턴 인식). `autoFillRange`를 쓸 때는 항상 패턴을 판단할 수 있는 시드 셀을 최소 2개
 이상 채워두고 나머지 빈 칸까지 포함한 전체 범위를 넘길 것.
 
+### 17. `updateDimensionGroup`은 `depth`를 안 주면 400 에러 ("depth must be > 0")
+그룹 접기/펼치기(`collapseGroup`/`expandGroup`) 만들다가 실측: `dimensionGroup`에 `range`와
+`collapsed`만 넣고 `depth`를 생략하면 거부당한다. `addDimensionGroup`으로 만든(중첩 없는) 그룹은
+항상 depth 1이라서 `setDimensionGroupCollapsed`는 기본값 `depth=1`을 자동으로 넣어준다 — 그룹을
+중첩해서 만든 경우에만 depth를 다르게 넘겨야 함.
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`
@@ -129,10 +135,23 @@ Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1�
 필터 뷰: `addFilterView`, `deleteFilterView`, `duplicateFilterView`
 개발자 메타데이터: `addMetadata`, `findMetadata`, `deleteMetadata`
 데이터 정리: `trimWhitespace`, `deleteDuplicates`, `autoFillRange`
-기타: `tabs`, `metadata`, `batchUpdate`
+셀 단위 조작: `cutPaste`(잘라내기), `insertCells`/`deleteCells`(부분 범위만 시프트, 행/열 통째 아님)
+그룹 접기/펼치기: `collapseGroup`, `expandGroup`
+기타: `randomize`(행 순서 섞기), `setLocale`(로케일/시간대), `tabs`, `metadata`, `batchUpdate`
 
-총 73개 명령. 전부 `1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`(실험실 스프레드시트)에서 실행 →
-`get`/`metadata`로 반영 확인 → 테스트 흔적 정리(clear/delete) 순서로 검증했다.
+총 80개 명령. 전부 `1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`(실험실 스프레드시트)에서 실행 →
+`get`/`metadata`로 반영 확인 → 테스트 흔적 정리(clear/delete/원복) 순서로 검증했다. 이 과정에서
+실제로 잡은 버그 3개: `setGridlines`의 잘못된 필드명(#15), `updateDimensionGroup`의 `depth` 누락(#17),
+`parseRange`의 순수 행 범위 미지원(#14).
+
+## 커버 안 한 것 (의도적으로 스킵)
+
+실사용 가치가 낮거나 엔터프라이즈 전용이라 스킵한 것들 — 필요해지면 그때 추가:
+- 슬라이서(addSlicer), 커넥티드 시트/BigQuery 데이터소스 — 엔터프라이즈 기능
+- updateFilterView, updateProtectedRange, updateConditionalFormatRule, updateBanding, updateChartSpec,
+  updateDeveloperMetadata — "수정"류는 대부분 delete 후 add로 대체 가능해서 우선순위 낮춤
+- 리치텍스트 하이퍼링크(TextFormatRun 단위) — `=HYPERLINK()` 수식으로 실용적으로 충분히 대체됨
+- 이미지 삽입 — Sheets API v4 batchUpdate에 원래 없음(`=IMAGE()` 수식이 사실상 유일한 방법)
 
 모두 실험용 스프레드시트(`1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`)에서 실제로 실행하고
 `get`/`metadata`로 결과까지 확인한 것들이다 — 문서만 보고 추측한 게 아님.

@@ -95,6 +95,13 @@
 //   node sheets.js deleteDuplicates <spreadsheetId> <range> [비교열JSON 예:'["B","C"]']
 //   node sheets.js autoFillRange <spreadsheetId> <range>       패턴 있는 셀+빈 셀 전체 범위 (드래그 채우기와 동일)
 //
+// --- 기타 셀/시트 조작 ---
+//   node sheets.js cutPaste <spreadsheetId> <소스range> <목적지시작셀>   ⚠️ 원본은 지워짐(잘라내기)
+//   node sheets.js insertCells|deleteCells <spreadsheetId> <range> <ROWS|COLUMNS>   부분 범위만 밀어냄/당겨짐(행·열 통째 아님)
+//   node sheets.js collapseGroup|expandGroup <spreadsheetId> "SheetName" <ROWS|COLUMNS> <시작번호> <끝번호>
+//   node sheets.js randomize <spreadsheetId> <range>            행 순서 무작위로 섞기
+//   node sheets.js setLocale <spreadsheetId> <locale> [timeZone]   예: setLocale id ko_KR Asia/Seoul
+//
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
 // 버그가 아닐 수 있다 — metadata로 bandedRanges 먼저 확인해볼 것.
@@ -1164,6 +1171,102 @@ async function autoFillRange(sheets, spreadsheetId, rangeStr) {
   return res.data;
 }
 
+// ---------- 잘라내기(이동, 원본은 지워짐) ----------
+
+async function cutPaste(sheets, spreadsheetId, sourceRangeStr, destCellStr) {
+  const src = parseRange(sourceRangeStr);
+  const srcSheetId = await getSheetId(sheets, spreadsheetId, src.sheetName);
+  const idx = destCellStr.lastIndexOf("!");
+  const destSheetName = idx === -1 ? src.sheetName : destCellStr.slice(0, idx).replace(/^'|'$/g, "");
+  const destCellOnly = idx === -1 ? destCellStr : destCellStr.slice(idx + 1);
+  const destSheetId = await getSheetId(sheets, spreadsheetId, destSheetName);
+  const destParsed = parseRange(`${destSheetName}!${destCellOnly}`);
+  const req = {
+    cutPaste: {
+      source: rangeToGridRange(srcSheetId, src),
+      destination: {
+        sheetId: destSheetId,
+        rowIndex: destParsed.startRow - 1,
+        columnIndex: destParsed.startCol,
+      },
+      pasteType: "PASTE_NORMAL",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 셀 단위 삽입/삭제 (행/열 통째가 아니라 부분 시프트) ----------
+
+// shiftDim: "ROWS"(아래로 밀림) | "COLUMNS"(오른쪽으로 밀림)
+async function insertCellRange(sheets, spreadsheetId, rangeStr, shiftDim) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("insertCells는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { insertRange: { range: rangeToGridRange(sheetId, r), shiftDimension: shiftDim } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// shiftDim: 삭제 후 채워질 방향 — "ROWS"(아래→위로 당김) | "COLUMNS"(오른쪽→왼쪽으로 당김)
+async function deleteCellRange(sheets, spreadsheetId, rangeStr, shiftDim) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("deleteCells는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { deleteRange: { range: rangeToGridRange(sheetId, r), shiftDimension: shiftDim } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 행/열 그룹 접기/펼치기 (그룹 자체는 addDimensionGroup으로 이미 생성돼 있어야 함) ----------
+
+// ⚠️ depth를 안 주면 "depth must be > 0" 400 에러남(실측) — addDimensionGroup으로 만든 중첩 없는
+// 그룹은 항상 depth 1이므로 기본값 1을 준다. 그룹을 중첩해서 만들었으면 depth를 맞게 지정할 것.
+async function setDimensionGroupCollapsed(sheets, spreadsheetId, sheetName, dimension, start1based, end1based, collapsed, depth = 1) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    updateDimensionGroup: {
+      dimensionGroup: {
+        range: { sheetId, dimension, startIndex: start1based - 1, endIndex: end1based },
+        depth,
+        collapsed,
+      },
+      fields: "collapsed",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 행 순서 무작위 섞기 ----------
+
+async function randomizeRows(sheets, spreadsheetId, rangeStr) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("randomize는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { randomizeRange: { range: rangeToGridRange(sheetId, r) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 스프레드시트 로케일 / 시간대 ----------
+
+async function setSpreadsheetLocale(sheets, spreadsheetId, locale, timeZone) {
+  const props = {};
+  const fields = [];
+  if (locale) {
+    props.locale = locale;
+    fields.push("locale");
+  }
+  if (timeZone) {
+    props.timeZone = timeZone;
+    fields.push("timeZone");
+  }
+  const req = { updateSpreadsheetProperties: { properties: props, fields: fields.join(",") } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
 // ---------- ARRAYFORMULA 안전장치 ----------
 
 async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
@@ -2010,6 +2113,75 @@ async function main() {
       break;
     }
 
+    case "cutPaste": {
+      const [spreadsheetId, sourceRange, destCell] = rest;
+      if (!spreadsheetId || !sourceRange || !destCell)
+        fail(
+          '사용법: cutPaste <spreadsheetId> <소스range> <목적지시작셀>  예: cutPaste id "Sheet1!A1:B5" "Sheet1!D1"  ⚠️ 원본은 지워짐(잘라내기)'
+        );
+      const res = await cutPaste(sheets, spreadsheetId, sourceRange, destCell);
+      printResult(res);
+      break;
+    }
+
+    case "insertCells": {
+      const [spreadsheetId, range, shiftDim] = rest;
+      if (!spreadsheetId || !range || !shiftDim)
+        fail('사용법: insertCells <spreadsheetId> <range> <ROWS|COLUMNS>  (부분 범위만 밀어냄, 행/열 통째 아님)');
+      const res = await insertCellRange(sheets, spreadsheetId, range, shiftDim);
+      printResult(res);
+      break;
+    }
+
+    case "deleteCells": {
+      const [spreadsheetId, range, shiftDim] = rest;
+      if (!spreadsheetId || !range || !shiftDim)
+        fail('사용법: deleteCells <spreadsheetId> <range> <ROWS|COLUMNS>  ⚠️ 되돌릴 수 없음, 부분 범위만 당겨짐');
+      const res = await deleteCellRange(sheets, spreadsheetId, range, shiftDim);
+      printResult(res);
+      break;
+    }
+
+    case "collapseGroup":
+    case "expandGroup": {
+      const [spreadsheetId, sheetName, dimStr, startStr, endStr] = rest;
+      if (!spreadsheetId || !sheetName || !dimStr || !startStr || !endStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <ROWS|COLUMNS> <시작번호> <끝번호>  (addDimensionGroup으로 그룹이 먼저 있어야 함)`);
+      const res = await setDimensionGroupCollapsed(
+        sheets,
+        spreadsheetId,
+        sheetName,
+        dimStr,
+        parseInt(startStr, 10),
+        parseInt(endStr, 10),
+        cmd === "collapseGroup"
+      );
+      printResult(res);
+      break;
+    }
+
+    case "randomize": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail("사용법: randomize <spreadsheetId> <range>  행 순서를 무작위로 섞음");
+      const res = await randomizeRows(sheets, spreadsheetId, range);
+      printResult(res);
+      break;
+    }
+
+    case "setLocale": {
+      const [spreadsheetId, locale, timeZone] = rest;
+      if (!spreadsheetId || (!locale && !timeZone))
+        fail('사용법: setLocale <spreadsheetId> <locale예:ko_KR> [timeZone예:Asia/Seoul]  둘 중 하나만 줘도 됨(""로 생략)');
+      const res = await setSpreadsheetLocale(
+        sheets,
+        spreadsheetId,
+        locale && locale !== "" ? locale : undefined,
+        timeZone && timeZone !== "" ? timeZone : undefined
+      );
+      printResult(res);
+      break;
+    }
+
     case "clear": {
       const [spreadsheetId, range] = rest;
       if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
@@ -2052,6 +2224,7 @@ async function main() {
   setGridlines, hideRows, hideCols, showRows, showCols, groupRows, groupCols, ungroupRows, ungroupCols,
   addFilterView, deleteFilterView, duplicateFilterView, addMetadata, findMetadata, deleteMetadata,
   trimWhitespace, deleteDuplicates, autoFillRange,
+  cutPaste, insertCells, deleteCells, collapseGroup, expandGroup, randomize, setLocale,
   clear, metadata, batchUpdate
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
