@@ -96,6 +96,13 @@ Sheets API 응답은 protobuf 스타일이라 값이 0(기본값)이면 필드 �
 좌상단 셀 기준으로 수식이 각 셀에 상대적으로 적용됨). `$D$2`처럼 행까지 고정하면 전체 범위가
 2행의 값 하나만 보고 통째로 켜지거나 꺼진다.
 
+### 14. `parseRange`는 원래 "3:3" 같은 순수 행 범위(열 없음)를 못 읽었음 — 고침
+`setRowHeight` 만들다가 실제로 걸린 버그. `A1:C5` 형태만 파싱하던 정규식이 "3:3"(전체 열에 걸친
+행 범위)을 거부했다. `parseRange`에 순수 숫자(`^\d+(:\d+)?$`) 케이스를 먼저 검사하도록 추가하고,
+`startCol`/`endCol`이 `null`이면 `rangeToGridRange`가 `startColumnIndex`/`endColumnIndex` 자체를
+생략하도록(시트 전체 열을 의미) 고쳤다. `setWidth`가 쓰는 "G:G"(열만, 행 없음) 형태는 원래도 됐었음 —
+이번에 고친 건 반대 방향(행만, 열 없음)이었다.
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`

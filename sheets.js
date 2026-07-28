@@ -61,6 +61,9 @@
 //   node sheets.js copySheetTo <spreadsheetId> "SheetName" <대상spreadsheetId>   다른(또는 같은) 스프레드시트로 시트 복사
 //   node sheets.js renameSpreadsheet <spreadsheetId> "새 제목"           스프레드시트 파일 자체의 제목 변경
 //   node sheets.js setBorder <spreadsheetId> <range> <all|outer|inner|top,bottom,...> [--color=#000000] [--style=SOLID|DASHED|DOTTED|DOUBLE|SOLID_MEDIUM|SOLID_THICK]
+//   node sheets.js unmerge <spreadsheetId> <range>
+//   node sheets.js setRowHeight <spreadsheetId> "Sheet1!3:3" <pixels>
+//   node sheets.js moveRows|moveCols <spreadsheetId> "SheetName" <시작번호> <끝번호> <이동목적지(그 앞으로)>
 //
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
@@ -131,6 +134,20 @@ function parseRange(range) {
   let sheetName = range.slice(0, idx);
   if (sheetName.startsWith("'") && sheetName.endsWith("'")) sheetName = sheetName.slice(1, -1);
   const cellPart = range.slice(idx + 1);
+
+  // 순수 행 범위 (열 없음, 예: "3:3", "5:10") — 시트 전체 열에 걸친 행 지정
+  const rowOnly = cellPart.match(/^(\d+)(?::(\d+))?$/);
+  if (rowOnly) {
+    const [, rowA, rowB] = rowOnly;
+    return {
+      sheetName,
+      startCol: null,
+      startRow: parseInt(rowA, 10),
+      endCol: null,
+      endRow: rowB ? parseInt(rowB, 10) : parseInt(rowA, 10),
+    };
+  }
+
   const m = cellPart.match(/^([A-Za-z]+)(\d+)?(?::([A-Za-z]+)(\d+)?)?$/);
   if (!m) fail(`범위 형식을 이해 못함: ${cellPart}`);
   const [, colA, rowA, colB, rowB] = m;
@@ -170,8 +187,9 @@ function rangeToGridRange(sheetId, r) {
     sheetId,
     startRowIndex: r.startRow ? r.startRow - 1 : undefined,
     endRowIndex: r.endRow ? r.endRow : undefined,
-    startColumnIndex: r.startCol,
-    endColumnIndex: r.endCol + 1,
+    // startCol/endCol이 null이면(순수 행 범위, 예: "3:3") 열 인덱스 자체를 생략 — 시트 전체 열을 의미
+    startColumnIndex: r.startCol === null || r.startCol === undefined ? undefined : r.startCol,
+    endColumnIndex: r.endCol === null || r.endCol === undefined ? undefined : r.endCol + 1,
   };
 }
 
@@ -850,6 +868,45 @@ async function setBorder(sheets, spreadsheetId, rangeStr, sides, opts = {}) {
   return res.data;
 }
 
+// ---------- 병합 해제 / 행높이 / 행·열 이동 ----------
+
+async function unmergeCells(sheets, spreadsheetId, rangeStr) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("unmerge는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { unmergeCells: { range: rangeToGridRange(sheetId, r) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function setRowHeight(sheets, spreadsheetId, rangeStr, pixelSize) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("setRowHeight는 행 번호가 명시된 범위가 필요함 (예: Sheet1!3:3)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    updateDimensionProperties: {
+      range: { sheetId, dimension: "ROWS", startIndex: r.startRow - 1, endIndex: r.endRow },
+      properties: { pixelSize },
+      fields: "pixelSize",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// dimension: ROWS|COLUMNS. 1-based 번호로 [start,end] 구간을 destinationIndex 앞으로 옮김
+async function moveRowsOrCols(sheets, spreadsheetId, sheetName, dimension, start1based, end1based, destBefore1based) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    moveDimension: {
+      source: { sheetId, dimension, startIndex: start1based - 1, endIndex: end1based },
+      destinationIndex: destBefore1based - 1,
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
 // ---------- ARRAYFORMULA 안전장치 ----------
 
 async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
@@ -1459,6 +1516,44 @@ async function main() {
       break;
     }
 
+    case "unmerge": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail('사용법: unmerge <spreadsheetId> <range>');
+      const res = await unmergeCells(sheets, spreadsheetId, range);
+      printResult(res);
+      break;
+    }
+
+    case "setRowHeight": {
+      const [spreadsheetId, range, pixelsStr] = rest;
+      if (!spreadsheetId || !range || !pixelsStr)
+        fail('사용법: setRowHeight <spreadsheetId> "Sheet1!3:3" <pixels>');
+      const pixels = parseInt(pixelsStr, 10);
+      if (Number.isNaN(pixels)) fail("pixels는 숫자여야 함");
+      const res = await setRowHeight(sheets, spreadsheetId, range, pixels);
+      printResult(res);
+      break;
+    }
+
+    case "moveRows":
+    case "moveCols": {
+      const [spreadsheetId, sheetName, startStr, endStr, destStr] = rest;
+      if (!spreadsheetId || !sheetName || !startStr || !endStr || !destStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <시작번호> <끝번호> <이동목적지(그 앞으로)>`);
+      const dim = cmd === "moveRows" ? "ROWS" : "COLUMNS";
+      const res = await moveRowsOrCols(
+        sheets,
+        spreadsheetId,
+        sheetName,
+        dim,
+        parseInt(startStr, 10),
+        parseInt(endStr, 10),
+        parseInt(destStr, 10)
+      );
+      printResult(res);
+      break;
+    }
+
     case "clear": {
       const [spreadsheetId, range] = rest;
       if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
@@ -1496,7 +1591,7 @@ async function main() {
   addSheet, deleteSheet, renameSheet, duplicateSheet, freeze, insertRows, insertCols, deleteRows, deleteCols, sort,
   validate, clearValidation, findReplace, numberFormat, note, addNamedRange, deleteNamedRange, protect, addBanding,
   addChart, setFilter, clearFilter, splitText, addPivot, condFormat, copySheetTo, renameSpreadsheet, setBorder,
-  clear, metadata, batchUpdate
+  unmerge, setRowHeight, moveRows, moveCols, clear, metadata, batchUpdate
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }
