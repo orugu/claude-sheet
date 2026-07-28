@@ -121,6 +121,15 @@ Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1�
 항상 depth 1이라서 `setDimensionGroupCollapsed`는 기본값 `depth=1`을 자동으로 넣어준다 — 그룹을
 중첩해서 만든 경우에만 depth를 다르게 넘겨야 함.
 
+### 18. `addChart`는 값 열이 2개 이상이면 반드시 열마다 시리즈를 하나씩 따로 만들어야 함
+**실측으로 잡은 진짜 버그**: 처음 구현은 도메인(첫 열) 다음의 값 열 전체(예: B:D, 3열)를 시리즈
+"하나"의 `sourceRange`로 묶어서 보냈는데, 데이터 열이 3개 이상이면 API가 바로 거부한다 —
+`"ChartSourceRange ranges require all rows or all columns to have length of 1"`. 즉 시리즈 하나의
+`sourceRange`는 항상 폭이 1열이어야 한다. 고친 버전은 도메인 다음 열부터 끝 열까지 루프를 돌며
+**열마다 별도의 series 객체**를 만든다(`addChart`의 데이터 열이 2열=시리즈 1개일 때는 원래도 우연히
+안 걸렸던 것 — 2열 이하에서만 우연히 동작하던 잠복 버그). 여러 시리즈(막대 여러 개, 선 여러 개)
+차트를 만들 때 특히 중요.
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`

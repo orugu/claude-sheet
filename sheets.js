@@ -197,6 +197,14 @@ function parseRange(range) {
   };
 }
 
+// CLI에서 사용자가 직접 "rows"/"cols" 등으로 입력해도 API가 요구하는 정확한 대문자 enum으로 정규화
+function normalizeDimension(s) {
+  const up = (s || "").toUpperCase();
+  if (up === "ROWS" || up === "ROW") return "ROWS";
+  if (up === "COLUMNS" || up === "COL" || up === "COLS" || up === "COLUMN") return "COLUMNS";
+  fail(`ROWS 또는 COLUMNS만 가능함 (받은 값: "${s}")`);
+}
+
 function quoteSheetName(name) {
   return /[^A-Za-z0-9_]/.test(name) ? `'${name}'` : name;
 }
@@ -252,6 +260,7 @@ async function copyFormat(sheets, spreadsheetId, sourceRangeStr, destRangeStr) {
 // 열 폭을 고정 픽셀값으로 지정 (autoFit이 너무 넓게 잡았을 때 등)
 async function setColumnWidth(sheets, spreadsheetId, rangeStr, pixelSize) {
   const r = parseRange(rangeStr);
+  if (r.startCol === null) fail('setWidth는 열 범위가 필요함 (예: Sheet1!G:G) — 순수 행 범위("3:3")는 안 됨');
   const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
   const req = {
     updateDimensionProperties: {
@@ -581,14 +590,24 @@ const NUMBER_FORMAT_PRESETS = {
   SCIENTIFIC: "0.00E+00",
 };
 
+// 프리셋 키 -> 실제 Sheets API NumberFormatType. "INTEGER"는 API에 없는 타입이라 NUMBER로 매핑.
+const NUMBER_FORMAT_API_TYPES = {
+  NUMBER: "NUMBER",
+  INTEGER: "NUMBER",
+  CURRENCY: "CURRENCY",
+  PERCENT: "PERCENT",
+  DATE: "DATE",
+  TIME: "TIME",
+  DATE_TIME: "DATE_TIME",
+  SCIENTIFIC: "SCIENTIFIC",
+};
+
 async function setNumberFormat(sheets, spreadsheetId, rangeStr, typeOrPattern) {
   const r = parseRange(rangeStr);
   if (!r.startRow || !r.endRow) fail("numberFormat은 행 번호가 명시된 범위가 필요함");
   const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
   const pattern = NUMBER_FORMAT_PRESETS[typeOrPattern] || typeOrPattern;
-  const apiType = Object.keys(NUMBER_FORMAT_PRESETS).includes(typeOrPattern)
-    ? typeOrPattern.replace("INTEGER", "NUMBER").replace("DATE_TIME", "DATE_TIME")
-    : "NUMBER";
+  const apiType = NUMBER_FORMAT_API_TYPES[typeOrPattern] || "NUMBER"; // 프리셋이 아니라 커스텀 패턴이면 NUMBER 기준
   const req = {
     repeatCell: {
       range: rangeToGridRange(sheetId, r),
@@ -681,8 +700,13 @@ async function addChart(sheets, spreadsheetId, sheetName, chartType, dataRangeSt
       },
     },
   };
-  const series = [
-    {
+  // ⚠️ 실측 확인된 API 제약: series 하나의 sourceRange는 반드시 열 폭이 1이어야 함
+  // ("ChartSourceRange ranges require all rows or all columns to have length of 1" 400 에러).
+  // 데이터가 3열 이상(도메인 1열 + 값 2열 이상)이면 값 열마다 series를 하나씩 따로 만들어야 함 —
+  // 전에는 값 열 전체를 series 하나로 뭉쳐서 넘겨서 3열 이상일 때 항상 에러가 났었음.
+  const series = [];
+  for (let col = dr.startCol + 1; col <= dr.endCol; col++) {
+    series.push({
       series: {
         sourceRange: {
           sources: [
@@ -690,16 +714,15 @@ async function addChart(sheets, spreadsheetId, sheetName, chartType, dataRangeSt
               sheetId,
               startRowIndex: dr.startRow - 1,
               endRowIndex: dr.endRow,
-              startColumnIndex: dr.startCol + 1,
-              endColumnIndex: dr.endCol + 1,
+              startColumnIndex: col,
+              endColumnIndex: col + 1,
             },
           ],
         },
       },
       targetAxis: "LEFT_AXIS",
-    },
-  ];
-  const chartSheetId = sheetId; // 앵커를 데이터가 있는 시트에 둠
+    });
+  }
   const anchorCell = opts.anchorCell ? parseRange(`${sheetName}!${opts.anchorCell}`) : null;
 
   const req = {
@@ -719,7 +742,7 @@ async function addChart(sheets, spreadsheetId, sheetName, chartType, dataRangeSt
         position: {
           overlayPosition: {
             anchorCell: {
-              sheetId: chartSheetId,
+              sheetId, // 데이터가 있는 시트에 앵커
               rowIndex: anchorCell ? anchorCell.startRow - 1 : dr.endRow,
               columnIndex: anchorCell ? anchorCell.startCol : dr.endCol + 2,
             },
@@ -879,7 +902,7 @@ async function renameSpreadsheet(sheets, spreadsheetId, newTitle) {
 
 // ---------- 테두리 ----------
 
-// sides: "all" | "outer" | "inner" | "top,bottom,left,right,innerH,innerV" 콤마 조합
+// sides: "all" | "outer" | "inner" | "top,bottom,left,right,innerHorizontal,innerVertical" 콤마 조합 (풀네임만 인식, 축약형 없음)
 async function setBorder(sheets, spreadsheetId, rangeStr, sides, opts = {}) {
   const r = parseRange(rangeStr);
   if (!r.startRow || !r.endRow) fail("border는 행 번호가 명시된 범위가 필요함");
@@ -1317,7 +1340,6 @@ async function guardArrayFormulaCollision(sheets, spreadsheetId, range, force) {
 // ---------- appendRow: 실제 마지막 데이터 행을 스캔해서 정확한 위치에 쓰기 ----------
 
 async function appendRowSafe(sheets, spreadsheetId, sheetName, keyColLetter, values, force, formatFrom, startColLetter = "A") {
-  const keyColIdx = colLetterToIndex(keyColLetter);
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range: `${quoteSheetName(sheetName)}!${keyColLetter}1:${keyColLetter}2000`,
@@ -2128,7 +2150,7 @@ async function main() {
       const [spreadsheetId, range, shiftDim] = rest;
       if (!spreadsheetId || !range || !shiftDim)
         fail('사용법: insertCells <spreadsheetId> <range> <ROWS|COLUMNS>  (부분 범위만 밀어냄, 행/열 통째 아님)');
-      const res = await insertCellRange(sheets, spreadsheetId, range, shiftDim);
+      const res = await insertCellRange(sheets, spreadsheetId, range, normalizeDimension(shiftDim));
       printResult(res);
       break;
     }
@@ -2137,7 +2159,7 @@ async function main() {
       const [spreadsheetId, range, shiftDim] = rest;
       if (!spreadsheetId || !range || !shiftDim)
         fail('사용법: deleteCells <spreadsheetId> <range> <ROWS|COLUMNS>  ⚠️ 되돌릴 수 없음, 부분 범위만 당겨짐');
-      const res = await deleteCellRange(sheets, spreadsheetId, range, shiftDim);
+      const res = await deleteCellRange(sheets, spreadsheetId, range, normalizeDimension(shiftDim));
       printResult(res);
       break;
     }
@@ -2151,7 +2173,7 @@ async function main() {
         sheets,
         spreadsheetId,
         sheetName,
-        dimStr,
+        normalizeDimension(dimStr),
         parseInt(startStr, 10),
         parseInt(endStr, 10),
         cmd === "collapseGroup"
