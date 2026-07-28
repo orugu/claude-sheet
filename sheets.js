@@ -65,6 +65,36 @@
 //   node sheets.js setRowHeight <spreadsheetId> "Sheet1!3:3" <pixels>
 //   node sheets.js moveRows|moveCols <spreadsheetId> "SheetName" <시작번호> <끝번호> <이동목적지(그 앞으로)>
 //
+// --- 삭제 계열 (id는 각 add* 명령의 응답 또는 metadata에서 확인) ---
+//   node sheets.js deleteProtect <spreadsheetId> <protectedRangeId>
+//   node sheets.js deleteBanding <spreadsheetId> <bandedRangeId>
+//   node sheets.js deleteCondFormat <spreadsheetId> "SheetName" <index>       0-based
+//   node sheets.js deleteChart <spreadsheetId> <chartId>
+//   node sheets.js moveChart <spreadsheetId> <chartId> "SheetName" <앵커셀> [--width=] [--height=]
+//
+// --- 시트 시각 속성 ---
+//   node sheets.js setTabColor <spreadsheetId> "SheetName" <#RRGGBB>
+//   node sheets.js hideSheet|showSheet <spreadsheetId> "SheetName"
+//   node sheets.js setGridlines <spreadsheetId> "SheetName" <on|off>
+//   node sheets.js hideRows|hideCols|showRows|showCols <spreadsheetId> "SheetName" <시작번호> [끝번호]
+//   node sheets.js groupRows|groupCols <spreadsheetId> "SheetName" <시작번호> <끝번호>       접기/펼치기 그룹
+//   node sheets.js ungroupRows|ungroupCols <spreadsheetId> "SheetName" <시작번호> <끝번호>
+//
+// --- 필터 뷰 (기본 필터 setFilter와 별개로 여러 개 저장 가능) ---
+//   node sheets.js addFilterView <spreadsheetId> <range(헤더포함)> <제목>
+//   node sheets.js deleteFilterView <spreadsheetId> <filterId>
+//   node sheets.js duplicateFilterView <spreadsheetId> <filterId>
+//
+// --- 개발자 메타데이터 (키-값을 시트/범위/문서 전체에 붙여서 나중에 검색 가능) ---
+//   node sheets.js addMetadata <spreadsheetId> <key> <value> [--sheetTarget="SheetName"] [--range="3:5"] [--visibility=DOCUMENT|PROJECT]
+//   node sheets.js findMetadata <spreadsheetId> <key>
+//   node sheets.js deleteMetadata <spreadsheetId> <key>
+//
+// --- 데이터 정리 ---
+//   node sheets.js trimWhitespace <spreadsheetId> <range>
+//   node sheets.js deleteDuplicates <spreadsheetId> <range> [비교열JSON 예:'["B","C"]']
+//   node sheets.js autoFillRange <spreadsheetId> <range>       패턴 있는 셀+빈 셀 전체 범위 (드래그 채우기와 동일)
+//
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
 // 버그가 아닐 수 있다 — metadata로 bandedRanges 먼저 확인해볼 것.
@@ -907,6 +937,233 @@ async function moveRowsOrCols(sheets, spreadsheetId, sheetName, dimension, start
   return res.data;
 }
 
+// ---------- 삭제 계열 (보호범위/밴딩/조건부서식/차트) ----------
+
+async function deleteProtectedRange(sheets, spreadsheetId, protectedRangeId) {
+  const req = { deleteProtectedRange: { protectedRangeId: parseInt(protectedRangeId, 10) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function deleteBandingRange(sheets, spreadsheetId, bandedRangeId) {
+  const req = { deleteBanding: { bandedRangeId: parseInt(bandedRangeId, 10) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function deleteConditionalFormat(sheets, spreadsheetId, sheetName, index) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = { deleteConditionalFormatRule: { sheetId, index: parseInt(index, 10) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function deleteChart(sheets, spreadsheetId, chartId) {
+  const req = { deleteEmbeddedObject: { objectId: parseInt(chartId, 10) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function moveChart(sheets, spreadsheetId, chartId, sheetName, anchorCellStr, width, height) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const anchor = parseRange(`${sheetName}!${anchorCellStr}`);
+  const req = {
+    updateEmbeddedObjectPosition: {
+      objectId: parseInt(chartId, 10),
+      newPosition: {
+        overlayPosition: {
+          anchorCell: { sheetId, rowIndex: anchor.startRow - 1, columnIndex: anchor.startCol },
+          ...(width ? { widthPixels: width } : {}),
+          ...(height ? { heightPixels: height } : {}),
+        },
+      },
+      fields: "*",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 시트 시각 속성: 탭 색상 / 숨기기 / 그리드라인 ----------
+
+async function setTabColor(sheets, spreadsheetId, sheetName, hex) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    updateSheetProperties: {
+      properties: { sheetId, tabColorStyle: { rgbColor: hexToRgb(hex) } },
+      fields: "tabColorStyle",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function setSheetHidden(sheets, spreadsheetId, sheetName, hidden) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = { updateSheetProperties: { properties: { sheetId, hidden }, fields: "hidden" } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ⚠️ API 필드는 "showGrid"가 아니라 "hideGridlines"(반전된 boolean) — 실측으로 확인함(showGrid는 400 에러)
+async function setGridlines(sheets, spreadsheetId, sheetName, show) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    updateSheetProperties: {
+      properties: { sheetId, gridProperties: { hideGridlines: !show } },
+      fields: "gridProperties.hideGridlines",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// dimension: ROWS|COLUMNS, 1-based 구간을 숨기거나 다시 보이게
+async function setDimensionHidden(sheets, spreadsheetId, sheetName, dimension, start1based, end1based, hidden) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    updateDimensionProperties: {
+      range: { sheetId, dimension, startIndex: start1based - 1, endIndex: end1based },
+      properties: { hiddenByUser: hidden },
+      fields: "hiddenByUser",
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 행/열 그룹핑(접기/펼치기, 아웃라인) ----------
+
+async function addDimensionGroup(sheets, spreadsheetId, sheetName, dimension, start1based, end1based) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    addDimensionGroup: {
+      range: { sheetId, dimension, startIndex: start1based - 1, endIndex: end1based },
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function deleteDimensionGroup(sheets, spreadsheetId, sheetName, dimension, start1based, end1based) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const req = {
+    deleteDimensionGroup: {
+      range: { sheetId, dimension, startIndex: start1based - 1, endIndex: end1based },
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 필터 뷰 (여러 개 저장 가능, 기본 필터와 별개) ----------
+
+async function addFilterView(sheets, spreadsheetId, rangeStr, title) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("filterView는 행 번호가 명시된 범위가 필요함 (헤더 포함)");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    addFilterView: {
+      filter: { title, range: rangeToGridRange(sheetId, r) },
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].addFilterView.filter;
+}
+
+async function deleteFilterView(sheets, spreadsheetId, filterId) {
+  const req = { deleteFilterView: { filterId: parseInt(filterId, 10) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+async function duplicateFilterView(sheets, spreadsheetId, filterId) {
+  const req = { duplicateFilterView: { filterId: parseInt(filterId, 10) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].duplicateFilterView.filter;
+}
+
+// ---------- 개발자 메타데이터 (키-값을 시트/범위/스프레드시트에 붙여서 나중에 검색) ----------
+
+async function addDeveloperMetadata(sheets, spreadsheetId, key, value, opts = {}) {
+  const metadata = {
+    metadataKey: key,
+    metadataValue: value,
+    visibility: opts.visibility || "DOCUMENT",
+  };
+  if (opts.sheetName) {
+    const sheetId = await getSheetId(sheets, spreadsheetId, opts.sheetName);
+    if (opts.range) {
+      // 행 범위 기준으로만 지원 (예: "3:5") — 열 범위/셀 범위가 필요하면 dimension을 COLUMNS로 바꿔서 확장
+      const r = parseRange(`${opts.sheetName}!${opts.range}`);
+      if (!r.startRow) fail('developer metadata의 range는 행 범위여야 함 (예: --range="3:5")');
+      metadata.location = {
+        dimensionRange: { sheetId, dimension: "ROWS", startIndex: r.startRow - 1, endIndex: r.endRow },
+      };
+    } else {
+      metadata.location = { sheetId };
+    }
+  } else {
+    metadata.location = { spreadsheet: true };
+  }
+  const req = { createDeveloperMetadata: { developerMetadata: metadata } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].createDeveloperMetadata.developerMetadata;
+}
+
+async function searchDeveloperMetadata(sheets, spreadsheetId, key) {
+  const res = await sheets.spreadsheets.developerMetadata.search({
+    spreadsheetId,
+    requestBody: { dataFilters: [{ developerMetadataLookup: { metadataKey: key } }] },
+  });
+  return res.data.matchedDeveloperMetadata || [];
+}
+
+async function deleteDeveloperMetadata(sheets, spreadsheetId, key) {
+  const req = { deleteDeveloperMetadata: { dataFilter: { developerMetadataLookup: { metadataKey: key } } } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 데이터 정리: 공백 제거 / 중복 제거 / 자동 채우기 ----------
+
+async function trimWhitespace(sheets, spreadsheetId, rangeStr) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("trimWhitespace는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { trimWhitespace: { range: rangeToGridRange(sheetId, r) } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].trimWhitespace;
+}
+
+// compareCols: 중복 판단 기준 열문자 배열(생략하면 전체 열 기준)
+async function deleteDuplicateRows(sheets, spreadsheetId, rangeStr, compareCols = []) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("deleteDuplicates는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = {
+    deleteDuplicates: {
+      range: rangeToGridRange(sheetId, r),
+      ...(compareCols.length
+        ? { comparisonColumns: compareCols.map((c) => ({ sheetId, dimension: "COLUMNS", startIndex: colLetterToIndex(c), endIndex: colLetterToIndex(c) + 1 })) }
+        : {}),
+    },
+  };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data.replies[0].deleteDuplicates;
+}
+
+// 시트 UI에서 채우기 핸들을 드래그하는 것과 동일 — range 안에 이미 있는 패턴(수식, 순번, 요일 등)을
+// 감지해서 range의 나머지 빈 칸까지 자동 확장한다. range = 패턴이 있는 셀 + 채울 빈 셀 전체.
+async function autoFillRange(sheets, spreadsheetId, rangeStr) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("autoFillRange는 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const req = { autoFill: { range: rangeToGridRange(sheetId, r), useAlternateSeries: false } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
 // ---------- ARRAYFORMULA 안전장치 ----------
 
 async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
@@ -1043,7 +1300,7 @@ async function main() {
     "--lineHeight=", "--index=", "--description=", "--editors=", "--title=", "--anchorCell=",
     "--width=", "--height=", "--firstColor=", "--secondColor=", "--headerColor=",
     "--minColor=", "--midColor=", "--maxColor=", "--formula=", "--backgroundColor=",
-    "--color=", "--style=",
+    "--color=", "--style=", "--sheetTarget=", "--range=", "--visibility=",
   ];
   const args = rawArgs.filter(
     (a) => !KNOWN_FLAGS.includes(a) && !KNOWN_PREFIXES.some((p) => a.startsWith(p))
@@ -1554,6 +1811,205 @@ async function main() {
       break;
     }
 
+    case "deleteProtect": {
+      const [spreadsheetId, protectedRangeId] = rest;
+      if (!spreadsheetId || !protectedRangeId) fail("사용법: deleteProtect <spreadsheetId> <protectedRangeId>");
+      const res = await deleteProtectedRange(sheets, spreadsheetId, protectedRangeId);
+      printResult(res);
+      break;
+    }
+
+    case "deleteBanding": {
+      const [spreadsheetId, bandedRangeId] = rest;
+      if (!spreadsheetId || !bandedRangeId) fail("사용법: deleteBanding <spreadsheetId> <bandedRangeId>");
+      const res = await deleteBandingRange(sheets, spreadsheetId, bandedRangeId);
+      printResult(res);
+      break;
+    }
+
+    case "deleteCondFormat": {
+      const [spreadsheetId, sheetName, index] = rest;
+      if (!spreadsheetId || !sheetName || index === undefined)
+        fail('사용법: deleteCondFormat <spreadsheetId> "SheetName" <index>  (0-based, metadata로 확인)');
+      const res = await deleteConditionalFormat(sheets, spreadsheetId, sheetName, index);
+      printResult(res);
+      break;
+    }
+
+    case "deleteChart": {
+      const [spreadsheetId, chartId] = rest;
+      if (!spreadsheetId || !chartId) fail("사용법: deleteChart <spreadsheetId> <chartId>");
+      const res = await deleteChart(sheets, spreadsheetId, chartId);
+      printResult(res);
+      break;
+    }
+
+    case "moveChart": {
+      const [spreadsheetId, chartId, sheetName, anchorCell] = rest;
+      if (!spreadsheetId || !chartId || !sheetName || !anchorCell)
+        fail('사용법: moveChart <spreadsheetId> <chartId> "SheetName" <앵커셀예:D1> [--width=] [--height=]');
+      const res = await moveChart(
+        sheets,
+        spreadsheetId,
+        chartId,
+        sheetName,
+        anchorCell,
+        widthArg ? parseInt(widthArg.split("=")[1], 10) : undefined,
+        heightArg ? parseInt(heightArg.split("=")[1], 10) : undefined
+      );
+      printResult(res);
+      break;
+    }
+
+    case "setTabColor": {
+      const [spreadsheetId, sheetName, hex] = rest;
+      if (!spreadsheetId || !sheetName || !hex) fail('사용법: setTabColor <spreadsheetId> "SheetName" <#RRGGBB>');
+      const res = await setTabColor(sheets, spreadsheetId, sheetName, hex);
+      printResult(res);
+      break;
+    }
+
+    case "hideSheet":
+    case "showSheet": {
+      const [spreadsheetId, sheetName] = rest;
+      if (!spreadsheetId || !sheetName) fail(`사용법: ${cmd} <spreadsheetId> "SheetName"`);
+      const res = await setSheetHidden(sheets, spreadsheetId, sheetName, cmd === "hideSheet");
+      printResult(res);
+      break;
+    }
+
+    case "setGridlines": {
+      const [spreadsheetId, sheetName, onOff] = rest;
+      if (!spreadsheetId || !sheetName || !onOff)
+        fail('사용법: setGridlines <spreadsheetId> "SheetName" <on|off>');
+      const res = await setGridlines(sheets, spreadsheetId, sheetName, onOff === "on");
+      printResult(res);
+      break;
+    }
+
+    case "hideRows":
+    case "hideCols":
+    case "showRows":
+    case "showCols": {
+      const [spreadsheetId, sheetName, startStr, endStr] = rest;
+      if (!spreadsheetId || !sheetName || !startStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <시작번호> [끝번호=시작과동일]`);
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : start;
+      const dim = cmd.endsWith("Rows") ? "ROWS" : "COLUMNS";
+      const hidden = cmd.startsWith("hide");
+      const res = await setDimensionHidden(sheets, spreadsheetId, sheetName, dim, start, end, hidden);
+      printResult(res);
+      break;
+    }
+
+    case "groupRows":
+    case "groupCols": {
+      const [spreadsheetId, sheetName, startStr, endStr] = rest;
+      if (!spreadsheetId || !sheetName || !startStr || !endStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <시작번호> <끝번호>  (접기/펼치기 그룹 생성)`);
+      const dim = cmd === "groupRows" ? "ROWS" : "COLUMNS";
+      const res = await addDimensionGroup(sheets, spreadsheetId, sheetName, dim, parseInt(startStr, 10), parseInt(endStr, 10));
+      printResult(res);
+      break;
+    }
+
+    case "ungroupRows":
+    case "ungroupCols": {
+      const [spreadsheetId, sheetName, startStr, endStr] = rest;
+      if (!spreadsheetId || !sheetName || !startStr || !endStr)
+        fail(`사용법: ${cmd} <spreadsheetId> "SheetName" <시작번호> <끝번호>`);
+      const dim = cmd === "ungroupRows" ? "ROWS" : "COLUMNS";
+      const res = await deleteDimensionGroup(sheets, spreadsheetId, sheetName, dim, parseInt(startStr, 10), parseInt(endStr, 10));
+      printResult(res);
+      break;
+    }
+
+    case "addFilterView": {
+      const [spreadsheetId, range, title] = rest;
+      if (!spreadsheetId || !range || !title)
+        fail('사용법: addFilterView <spreadsheetId> <range(헤더포함)> <제목>');
+      const res = await addFilterView(sheets, spreadsheetId, range, title);
+      printResult(res);
+      break;
+    }
+
+    case "deleteFilterView": {
+      const [spreadsheetId, filterId] = rest;
+      if (!spreadsheetId || !filterId) fail("사용법: deleteFilterView <spreadsheetId> <filterId>");
+      const res = await deleteFilterView(sheets, spreadsheetId, filterId);
+      printResult(res);
+      break;
+    }
+
+    case "duplicateFilterView": {
+      const [spreadsheetId, filterId] = rest;
+      if (!spreadsheetId || !filterId) fail("사용법: duplicateFilterView <spreadsheetId> <filterId>");
+      const res = await duplicateFilterView(sheets, spreadsheetId, filterId);
+      printResult(res);
+      break;
+    }
+
+    case "addMetadata": {
+      const [spreadsheetId, key, value] = rest;
+      if (!spreadsheetId || !key || value === undefined)
+        fail(
+          '사용법: addMetadata <spreadsheetId> <key> <value> [--sheetTarget="SheetName"] [--range="3:5"] [--visibility=DOCUMENT|PROJECT]'
+        );
+      const sheetTargetArg = rawArgs.find((a) => a.startsWith("--sheetTarget="));
+      const rangeTargetArg = rawArgs.find((a) => a.startsWith("--range="));
+      const visibilityArg = rawArgs.find((a) => a.startsWith("--visibility="));
+      const res = await addDeveloperMetadata(sheets, spreadsheetId, key, value, {
+        sheetName: sheetTargetArg ? sheetTargetArg.split("=").slice(1).join("=") : undefined,
+        range: rangeTargetArg ? rangeTargetArg.split("=").slice(1).join("=") : undefined,
+        visibility: visibilityArg ? visibilityArg.split("=")[1] : undefined,
+      });
+      printResult(res);
+      break;
+    }
+
+    case "findMetadata": {
+      const [spreadsheetId, key] = rest;
+      if (!spreadsheetId || !key) fail("사용법: findMetadata <spreadsheetId> <key>");
+      const res = await searchDeveloperMetadata(sheets, spreadsheetId, key);
+      printResult(res);
+      break;
+    }
+
+    case "deleteMetadata": {
+      const [spreadsheetId, key] = rest;
+      if (!spreadsheetId || !key) fail("사용법: deleteMetadata <spreadsheetId> <key>");
+      const res = await deleteDeveloperMetadata(sheets, spreadsheetId, key);
+      printResult(res);
+      break;
+    }
+
+    case "trimWhitespace": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range) fail('사용법: trimWhitespace <spreadsheetId> <range>');
+      const res = await trimWhitespace(sheets, spreadsheetId, range);
+      printResult(res);
+      break;
+    }
+
+    case "deleteDuplicates": {
+      const [spreadsheetId, range, colsJson] = rest;
+      if (!spreadsheetId || !range) fail('사용법: deleteDuplicates <spreadsheetId> <range> [비교열JSON예:\'["B","C"]\']');
+      const compareCols = colsJson ? JSON.parse(colsJson) : [];
+      const res = await deleteDuplicateRows(sheets, spreadsheetId, range, compareCols);
+      printResult(res);
+      break;
+    }
+
+    case "autoFillRange": {
+      const [spreadsheetId, range] = rest;
+      if (!spreadsheetId || !range)
+        fail('사용법: autoFillRange <spreadsheetId> <range>  패턴 있는 셀+빈 셀 전체 범위 (드래그 채우기와 동일)');
+      const res = await autoFillRange(sheets, spreadsheetId, range);
+      printResult(res);
+      break;
+    }
+
     case "clear": {
       const [spreadsheetId, range] = rest;
       if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
@@ -1591,7 +2047,12 @@ async function main() {
   addSheet, deleteSheet, renameSheet, duplicateSheet, freeze, insertRows, insertCols, deleteRows, deleteCols, sort,
   validate, clearValidation, findReplace, numberFormat, note, addNamedRange, deleteNamedRange, protect, addBanding,
   addChart, setFilter, clearFilter, splitText, addPivot, condFormat, copySheetTo, renameSpreadsheet, setBorder,
-  unmerge, setRowHeight, moveRows, moveCols, clear, metadata, batchUpdate
+  unmerge, setRowHeight, moveRows, moveCols,
+  deleteProtect, deleteBanding, deleteCondFormat, deleteChart, moveChart, setTabColor, hideSheet, showSheet,
+  setGridlines, hideRows, hideCols, showRows, showCols, groupRows, groupCols, ungroupRows, ungroupCols,
+  addFilterView, deleteFilterView, duplicateFilterView, addMetadata, findMetadata, deleteMetadata,
+  trimWhitespace, deleteDuplicates, autoFillRange,
+  clear, metadata, batchUpdate
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }

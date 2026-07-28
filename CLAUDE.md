@@ -103,6 +103,18 @@ Sheets API 응답은 protobuf 스타일이라 값이 0(기본값)이면 필드 �
 생략하도록(시트 전체 열을 의미) 고쳤다. `setWidth`가 쓰는 "G:G"(열만, 행 없음) 형태는 원래도 됐었음 —
 이번에 고친 건 반대 방향(행만, 열 없음)이었다.
 
+### 15. `updateSheetProperties.gridProperties`는 `showGrid`가 아니라 `hideGridlines`(반전된 값)
+그리드라인 껐다 켜는 기능 만들다가 실측: `showGrid` 필드로 보내면 400 에러(`Cannot find field`)가
+난다. 실제 필드명은 `hideGridlines`이고 의미가 반대다(끄고 싶으면 `true`). `setGridlines` 명령은
+`on`/`off`를 받아서 내부적으로 `!show`로 뒤집어 보내도록 처리해둠 — 호출하는 쪽은 반전을 신경 안 써도 됨.
+
+### 16. `autoFill`은 시드 셀이 1개면 그냥 복사, 2개 이상이어야 패턴(등차수열 등)을 인식함
+실측 확인: `range`에 `N1`만 `1`로 채워두고 `N1:N6`에 autoFill을 걸면 전부 `1`로 복사만 된다.
+`N1=1, N2=2`처럼 시드를 2개 이상 채워야 `3,4,5,6`으로 등차 확장된다 — 이건 버그가 아니라 실제
+Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1개만 드래그하면 복사, 2개 이상 선택하고
+드래그해야 패턴 인식). `autoFillRange`를 쓸 때는 항상 패턴을 판단할 수 있는 시드 셀을 최소 2개
+이상 채워두고 나머지 빈 칸까지 포함한 전체 범위를 넘길 것.
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`
@@ -111,7 +123,16 @@ Sheets API 응답은 protobuf 스타일이라 값이 0(기본값)이면 필드 �
 행/열: `insertRows`, `insertCols`, `deleteRows`, `deleteCols`, `sort`
 데이터 품질: `validate`, `clearValidation`, `findReplace`, `splitText`
 구조/보호/분석: `addNamedRange`, `deleteNamedRange`, `protect`, `setFilter`, `clearFilter`, `addChart`, `addPivot`
+삭제/이동: `deleteProtect`, `deleteBanding`, `deleteCondFormat`, `deleteChart`, `moveChart`
+시각 속성: `setTabColor`, `hideSheet`, `showSheet`, `setGridlines`, `hideRows`, `hideCols`, `showRows`, `showCols`
+그룹핑: `groupRows`, `groupCols`, `ungroupRows`, `ungroupCols`
+필터 뷰: `addFilterView`, `deleteFilterView`, `duplicateFilterView`
+개발자 메타데이터: `addMetadata`, `findMetadata`, `deleteMetadata`
+데이터 정리: `trimWhitespace`, `deleteDuplicates`, `autoFillRange`
 기타: `tabs`, `metadata`, `batchUpdate`
+
+총 73개 명령. 전부 `1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`(실험실 스프레드시트)에서 실행 →
+`get`/`metadata`로 반영 확인 → 테스트 흔적 정리(clear/delete) 순서로 검증했다.
 
 모두 실험용 스프레드시트(`1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`)에서 실제로 실행하고
 `get`/`metadata`로 결과까지 확인한 것들이다 — 문서만 보고 추측한 게 아님.
