@@ -57,6 +57,8 @@
 //   node sheets.js splitText <spreadsheetId> <range> <구분자>            텍스트 나누기 (쉼표/탭/세미콜론/공백/커스텀)
 //   node sheets.js addPivot <spreadsheetId> <sourceRange> <대상시트> <앵커셀> <rowsJSON> <valuesJSON> [colsJSON]
 //                                                                        예: addPivot id "Sheet1!A1:F6" Sheet1 H1 '[{"col":"C"}]' '[{"col":"D","fn":"COUNTA"}]'
+//   node sheets.js condFormat <spreadsheetId> <range> <colorScale|formula> [--minColor=] [--midColor=] [--maxColor=] [--formula="=..."] [--backgroundColor=]
+//   node sheets.js copySheetTo <spreadsheetId> "SheetName" <대상spreadsheetId>   다른(또는 같은) 스프레드시트로 시트 복사
 //
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
@@ -752,6 +754,64 @@ async function addPivotTable(sheets, spreadsheetId, sourceRangeStr, anchorSheetN
   return res.data;
 }
 
+// ---------- 조건부 서식 ----------
+
+// mode "colorScale": {minColor,midColor,maxColor} (hex, mid 생략 가능)
+// mode "formula": {formula, backgroundColor} — formula는 "=" 포함, 범위 첫 셀 기준 상대참조
+async function addConditionalFormat(sheets, spreadsheetId, rangeStr, mode, opts = {}) {
+  const r = parseRange(rangeStr);
+  if (!r.startRow || !r.endRow) fail("conditionalFormat은 행 번호가 명시된 범위가 필요함");
+  const sheetId = await getSheetId(sheets, spreadsheetId, r.sheetName);
+  const gridRange = rangeToGridRange(sheetId, r);
+
+  let rule;
+  if (mode === "colorScale") {
+    const points = [{ color: hexToRgb(opts.minColor || "#F4C7C3"), type: "MIN" }];
+    if (opts.midColor) points.push({ color: hexToRgb(opts.midColor), type: "PERCENTILE", value: "50" });
+    points.push({ color: hexToRgb(opts.maxColor || "#B7E1CD"), type: "MAX" });
+    rule = {
+      ranges: [gridRange],
+      gradientRule: {
+        minpoint: { colorStyle: { rgbColor: points[0].color }, type: points[0].type },
+        ...(opts.midColor
+          ? { midpoint: { colorStyle: { rgbColor: points[1].color }, type: points[1].type, value: points[1].value } }
+          : {}),
+        maxpoint: {
+          colorStyle: { rgbColor: points[points.length - 1].color },
+          type: points[points.length - 1].type,
+        },
+      },
+    };
+  } else if (mode === "formula") {
+    if (!opts.formula) fail('formula 모드는 --formula="=..." 필요');
+    rule = {
+      ranges: [gridRange],
+      booleanRule: {
+        condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: opts.formula }] },
+        format: { backgroundColorStyle: { rgbColor: hexToRgb(opts.backgroundColor || "#FFF2CC") } },
+      },
+    };
+  } else {
+    fail('mode는 "colorScale" 또는 "formula"만 지원');
+  }
+
+  const req = { addConditionalFormatRule: { rule, index: 0 } };
+  const res = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [req] } });
+  return res.data;
+}
+
+// ---------- 시트를 다른(또는 같은) 스프레드시트로 복사 ----------
+
+async function copySheetTo(sheets, spreadsheetId, sheetName, destSpreadsheetId) {
+  const sheetId = await getSheetId(sheets, spreadsheetId, sheetName);
+  const res = await sheets.spreadsheets.sheets.copyTo({
+    spreadsheetId,
+    sheetId,
+    requestBody: { destinationSpreadsheetId: destSpreadsheetId },
+  });
+  return res.data;
+}
+
 // ---------- ARRAYFORMULA 안전장치 ----------
 
 async function findArrayFormulaColumns(sheets, spreadsheetId, sheetName) {
@@ -872,6 +932,11 @@ async function main() {
   const firstColorArg = rawArgs.find((a) => a.startsWith("--firstColor="));
   const secondColorArg = rawArgs.find((a) => a.startsWith("--secondColor="));
   const headerColorArg = rawArgs.find((a) => a.startsWith("--headerColor="));
+  const minColorArg = rawArgs.find((a) => a.startsWith("--minColor="));
+  const midColorArg = rawArgs.find((a) => a.startsWith("--midColor="));
+  const maxColorArg = rawArgs.find((a) => a.startsWith("--maxColor="));
+  const formulaArg = rawArgs.find((a) => a.startsWith("--formula="));
+  const backgroundColorArg = rawArgs.find((a) => a.startsWith("--backgroundColor="));
   const KNOWN_FLAGS = [
     "--force", "--formulas", "--noFormat", "--inheritBefore", "--noStrict", "--noDropdown",
     "--matchCase", "--entireCell", "--regex", "--warningOnly",
@@ -880,6 +945,7 @@ async function main() {
     "--formatFrom=", "--startCol=", "--mergeType=", "--dimension=", "--colWidth=", "--charWidth=",
     "--lineHeight=", "--index=", "--description=", "--editors=", "--title=", "--anchorCell=",
     "--width=", "--height=", "--firstColor=", "--secondColor=", "--headerColor=",
+    "--minColor=", "--midColor=", "--maxColor=", "--formula=", "--backgroundColor=",
   ];
   const args = rawArgs.filter(
     (a) => !KNOWN_FLAGS.includes(a) && !KNOWN_PREFIXES.some((p) => a.startsWith(p))
@@ -1302,6 +1368,34 @@ async function main() {
       break;
     }
 
+    case "condFormat": {
+      const [spreadsheetId, range, mode] = rest;
+      if (!spreadsheetId || !range || !mode)
+        fail(
+          '사용법: condFormat <spreadsheetId> <range> <colorScale|formula> [--minColor=] [--midColor=] [--maxColor=] [--formula="=..."] [--backgroundColor=]\n' +
+            '  예1: condFormat id "Sheet1!D2:D6" colorScale --minColor=#F4C7C3 --maxColor=#B7E1CD\n' +
+            '  예2: condFormat id "Sheet1!A2:F6" formula --formula=\'=$D2="완료"\' --backgroundColor=#D9EAD3'
+        );
+      const res = await addConditionalFormat(sheets, spreadsheetId, range, mode, {
+        minColor: minColorArg ? minColorArg.split("=")[1] : undefined,
+        midColor: midColorArg ? midColorArg.split("=")[1] : undefined,
+        maxColor: maxColorArg ? maxColorArg.split("=")[1] : undefined,
+        formula: formulaArg ? formulaArg.split("=").slice(1).join("=") : undefined,
+        backgroundColor: backgroundColorArg ? backgroundColorArg.split("=")[1] : undefined,
+      });
+      printResult(res);
+      break;
+    }
+
+    case "copySheetTo": {
+      const [spreadsheetId, sheetName, destSpreadsheetId] = rest;
+      if (!spreadsheetId || !sheetName || !destSpreadsheetId)
+        fail('사용법: copySheetTo <spreadsheetId> "SheetName" <대상spreadsheetId>');
+      const res = await copySheetTo(sheets, spreadsheetId, sheetName, destSpreadsheetId);
+      printResult(res);
+      break;
+    }
+
     case "clear": {
       const [spreadsheetId, range] = rest;
       if (!spreadsheetId || !range) fail("사용법: clear <spreadsheetId> <range>");
@@ -1338,7 +1432,7 @@ async function main() {
 사용 가능: tabs, get, batchGet, update, append, appendRow, copyFormat, merge, autoFit, setWidth, wrap, fitWrap,
   addSheet, deleteSheet, renameSheet, duplicateSheet, freeze, insertRows, insertCols, deleteRows, deleteCols, sort,
   validate, clearValidation, findReplace, numberFormat, note, addNamedRange, deleteNamedRange, protect, addBanding,
-  addChart, setFilter, clearFilter, splitText, addPivot, clear, metadata, batchUpdate
+  addChart, setFilter, clearFilter, splitText, addPivot, condFormat, copySheetTo, clear, metadata, batchUpdate
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }

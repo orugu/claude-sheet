@@ -90,11 +90,17 @@ Sheets API 응답은 protobuf 스타일이라 값이 0(기본값)이면 필드 �
 `addChart`로 1행에 차트를 앵커했는데 응답에 `anchorCell.rowIndex`가 안 보이면 버그가 아니라
 그냥 0행이라는 뜻 — `columnIndex`만 보이고 `rowIndex` 없으면 "0행"으로 해석할 것.
 
+### 13. `addConditionalFormat`의 `formula` 모드는 상대참조 — 범위의 "첫 셀" 기준으로 자동 확장됨
+`--formula='=$D2="완료"'`처럼 쓸 때, `$D2`는 컬럼만 고정(`$D`)하고 행은 상대참조(`2`)로 둬야
+범위 안의 각 행마다 그 행의 D열을 보고 판단한다(엑셀/시트의 조건부 서식 수식 규칙과 동일 — 범위의
+좌상단 셀 기준으로 수식이 각 셀에 상대적으로 적용됨). `$D$2`처럼 행까지 고정하면 전체 범위가
+2행의 값 하나만 보고 통째로 켜지거나 꺼진다.
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`
-서식: `copyFormat`, `merge`, `autoFit`, `setWidth`, `wrap`, `fitWrap`, `numberFormat`, `note`, `addBanding`
-시트 관리: `addSheet`, `deleteSheet`, `renameSheet`, `duplicateSheet`, `freeze`
+서식: `copyFormat`, `merge`, `autoFit`, `setWidth`, `wrap`, `fitWrap`, `numberFormat`, `note`, `addBanding`, `condFormat`
+시트 관리: `addSheet`, `deleteSheet`, `renameSheet`, `duplicateSheet`, `freeze`, `copySheetTo`
 행/열: `insertRows`, `insertCols`, `deleteRows`, `deleteCols`, `sort`
 데이터 품질: `validate`, `clearValidation`, `findReplace`, `splitText`
 구조/보호/분석: `addNamedRange`, `deleteNamedRange`, `protect`, `setFilter`, `clearFilter`, `addChart`, `addPivot`
