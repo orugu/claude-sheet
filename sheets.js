@@ -102,6 +102,10 @@
 //   node sheets.js randomize <spreadsheetId> <range>            행 순서 무작위로 섞기
 //   node sheets.js setLocale <spreadsheetId> <locale> [timeZone]   예: setLocale id ko_KR Asia/Seoul
 //
+// --- 자기 자신 업데이트 (Google 인증 없이 동작, git pull 기반) ---
+//   node sheets.js --check-update   원격(origin/main) 대비 몇 커밋 뒤처졌는지 확인만(pull 안 함)
+//   node sheets.js --update         위 확인 후 실제 git pull. 커밋 안 된 로컬 변경 있으면 중단.
+//
 // 참고: 표 안 서식은 셀 자체 서식(userEnteredFormat)과 줄무늬(밴딩) 서식이 섞여 있을 수 있다.
 // 밴딩이 걸린 열은 행 위치에 따라 배경색이 자동으로 바뀌니, 배경색이 위/아래 행과 달라 보여도
 // 버그가 아닐 수 있다 — metadata로 bandedRanges 먼저 확인해볼 것.
@@ -113,6 +117,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 const { google } = require("googleapis");
 
 const CONFIG_PATH = path.join(__dirname, "config.json");
@@ -132,6 +137,47 @@ function parseJsonArg(json, exampleHint) {
   } catch {
     fail(`JSON 파싱 실패${exampleHint ? ` — 예: ${exampleHint}` : ""} (받은 값: ${json})`);
   }
+}
+
+// csm 프로젝트의 "git 확인/업데이트" 기능과 같은 개념이지만, 이 CLI는 별도 위치에
+// "설치"되는 게 아니라 이 디렉토리에서 바로 실행하는 구조라 그냥 git pull이면 충분하다.
+function git(args) {
+  return execFileSync("git", args, { cwd: __dirname, encoding: "utf8" }).trim();
+}
+
+function checkUpdateStatus() {
+  git(["fetch", "--quiet", "origin"]);
+  const local = git(["rev-parse", "HEAD"]);
+  const remote = git(["rev-parse", "origin/main"]);
+  const behind = local === remote
+    ? 0
+    : parseInt(git(["rev-list", "--count", `${local}..${remote}`]), 10);
+  return { local, remote, behind };
+}
+
+function cmdCheckUpdate() {
+  const { behind, remote } = checkUpdateStatus();
+  if (behind === 0) {
+    console.log("이미 최신 버전입니다.");
+  } else {
+    console.log(`업데이트 있음: ${behind}커밋 뒤처짐 (origin/main: ${remote.slice(0, 7)})`);
+    console.log("적용하려면: node sheets.js --update");
+  }
+}
+
+function cmdUpdate() {
+  const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: __dirname, encoding: "utf8" }).trim();
+  if (dirty) {
+    fail("커밋 안 된 로컬 변경사항이 있어서 업데이트를 중단합니다(git status --porcelain 결과 있음). 직접 커밋/스태시 후 다시 시도하세요.");
+  }
+  const { behind, remote } = checkUpdateStatus();
+  if (behind === 0) {
+    console.log("이미 최신 버전입니다.");
+    return;
+  }
+  console.log(`${behind}커밋 뒤처짐 -> pull 진행...`);
+  console.log(git(["pull", "--ff-only", "origin", "main"]));
+  console.log(`업데이트 완료 (${remote.slice(0, 7)}).`);
 }
 
 function getClient() {
@@ -1470,6 +1516,11 @@ async function main() {
   while (argsEnd > 0 && isKnownFlag(rawArgs[argsEnd - 1])) argsEnd--;
   const args = rawArgs.slice(0, argsEnd);
   const [cmd, ...rest] = args;
+
+  // Google 인증(config.json/token.json) 없이도 동작해야 하는 명령이라 getClient() 전에 처리한다.
+  if (cmd === "--check-update") return cmdCheckUpdate();
+  if (cmd === "--update") return cmdUpdate();
+
   const sheets = getClient();
 
   switch (cmd) {
@@ -2286,7 +2337,7 @@ async function main() {
   addFilterView, deleteFilterView, duplicateFilterView, addMetadata, findMetadata, deleteMetadata,
   trimWhitespace, deleteDuplicates, autoFillRange,
   cutPaste, insertCells, deleteCells, collapseGroup, expandGroup, randomize, setLocale,
-  clear, metadata, batchUpdate
+  clear, metadata, batchUpdate, --check-update, --update
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }
