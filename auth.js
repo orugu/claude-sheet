@@ -3,7 +3,8 @@
 //
 // 사전 준비 (사용자가 Google Cloud Console에서 직접 해야 함):
 // 1. https://console.cloud.google.com 에서 프로젝트 생성
-// 2. "API 및 서비스 > 라이브러리"에서 Google Sheets API 활성화
+// 2. "API 및 서비스 > 라이브러리"에서 Google Sheets API와 Google Drive API 둘 다 활성화
+//    (Drive API는 list/create/trashSpreadsheet/exportCsv 등 파일 관리 명령에 필요)
 // 3. "API 및 서비스 > 사용자 인증 정보"에서 OAuth 클라이언트 ID 생성
 //    - 애플리케이션 유형: "데스크톱 앱"
 //    - 생성된 클라이언트 ID / 클라이언트 보안 비밀번호를 config.json에 입력
@@ -21,7 +22,7 @@ const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/callback`;
 
 const SCOPES = [
   "https://www.googleapis.com/auth/spreadsheets",
-  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/drive",
 ];
 
 function loadConfig() {

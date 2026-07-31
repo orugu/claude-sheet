@@ -39,8 +39,8 @@ node sheets.js batchGet <spreadsheetId> '["Sheet1!A1:B2","Sheet1!D1:D5"]'
 # 값/수식 쓰기 (USER_ENTERED라 "=SUM(A1:A5)" 같은 수식도 그대로 인식됨)
 node sheets.js update <spreadsheetId> "Sheet1!A1:B2" '[["이름","점수"],["철수",90]]'
 
-# 행 추가
-node sheets.js append <spreadsheetId> "Sheet1!A1" '[["새 행","값"]]'
+# 행 추가 (append 대신 appendRow — 키 열을 스캔해서 정확한 마지막 행 다음에 씀, 자세한 이유는 CLAUDE.md 참고)
+node sheets.js appendRow <spreadsheetId> "Sheet1" A '[["새 행","값"]]'
 
 # 범위 지우기
 node sheets.js clear <spreadsheetId> "Sheet1!A1:D10"
@@ -51,8 +51,9 @@ node sheets.js metadata <spreadsheetId>
 # 서식/차트/병합 등 고급 조작 — Sheets API batchUpdate 요청을 그대로 전달
 node sheets.js batchUpdate <spreadsheetId> '[{"repeatCell":{...}}]'
 
-# 시트 추가/삭제/이름변경/복제, 행·열 삽입/삭제, 정렬, 드롭다운, 필터, 피벗, 차트 등
-# 전체 명령 목록은 sheets.js 맨 위 주석 또는 CLAUDE.md 참고 (24개 이상의 전용 명령 지원)
+# 시트 추가/삭제/이름변경/복제, 행·열 삽입/삭제, 정렬, 드롭다운, 필터, 피벗, 차트,
+# Drive 파일 관리(list/create/trashSpreadsheet/exportCsv/exportXlsx) 등
+# 전체 명령 목록은 sheets.js 맨 위 주석 또는 CLAUDE.md 참고 (80개 이상의 전용 명령 지원)
 ```
 
 `spreadsheetId`는 시트 URL 중간의 긴 문자열이다:
@@ -61,4 +62,5 @@ node sheets.js batchUpdate <spreadsheetId> '[{"repeatCell":{...}}]'
 ## 참고
 
 - `config.json`, `token.json`에는 민감정보가 들어있음 — git에 커밋 금지(.gitignore 처리됨)
-- 스코프는 스프레드시트 전체 쓰기 + 드라이브 읽기전용. 필요시 `auth.js`의 SCOPES 수정 후 재인증
+- 스코프는 스프레드시트 전체 쓰기 + 드라이브 전체 읽기/쓰기(list/create/trashSpreadsheet/export 계열에 필요).
+  스코프가 넓어질 때마다 기존 `token.json`은 무효화되니 `node auth.js`로 재인증 필요

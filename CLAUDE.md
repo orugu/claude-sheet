@@ -138,6 +138,20 @@ Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1�
 재사용하도록 리팩터링. ARRAYFORMULA 가드가 걸리는 케이스/안 걸리는 케이스/`--startCol`로 우회하는
 케이스 전부 재검증해서 동작 동일함 확인.
 
+### 20. Drive 파일 관리 명령 추가 (2026-07-31) — `drive` 스코프로 재인증 필요, `list`/`create`/`exportCsv`/`exportXlsx`는 재인증 전에도 이미 동작함
+claude-slides-cli의 `getAuthClient()`/`getDriveClient()` 패턴을 그대로 이식해서 `list`(내 Drive
+스프레드시트 목록), `create <제목>`(신규 생성, Sheets API만 씀 — Drive 스코프 불필요), `trashSpreadsheet
+<id>`(휴지통 이동, 완전삭제 아님), `exportCsv`/`exportXlsx`(Drive `files.export`)를 추가했다. 이 중
+`create`는 원래부터 Sheets API 스코프만으로 됐던 것이고, **`list`/`exportCsv`/`exportXlsx`는 기존
+`drive.readonly` 스코프로도 이미 동작함을 실측 확인**(2026-07-31, `list`로 실제 파일 목록 조회,
+`exportXlsx`로 4949바이트 정상 xlsx 생성, `file` 명령으로 "Microsoft Excel 2007+" 확인). 반면
+**`trashSpreadsheet`(파일 쓰기)는 읽기전용 스코프로 403 PERMISSION_DENIED가 실제로 남**을 확인했다
+— 이 명령을 쓰려면 `auth.js`의 SCOPES를 `drive.readonly`→`drive`(전체 읽기/쓰기)로 바꾼 뒤
+(이미 반영됨) `node auth.js`로 브라우저 재동의를 거쳐 `token.json`을 갱신해야 한다. **주의**:
+`exportCsv`는 Drive API 제약으로 다중 시트 스프레드시트여도 첫 번째 시트만 내보내진다 — 전체
+시트가 필요하면 `exportXlsx`를 쓸 것. 테스트로 만든 `TEMP_drive_test_*` 스프레드시트는 재인증
+전이라 API로 못 지우고 Drive UI에서 수동 삭제 필요(아래 참고).
+
 ## 검증된 명령 전체 목록 (2026-07-28 기준, 실제 스프레드시트에 대해 전부 실행/확인함)
 
 값: `get`, `batchGet`, `update`, `append`, `appendRow`, `clear`
@@ -155,8 +169,9 @@ Sheets UI에서 채우기 핸들을 드래그할 때와 동일한 동작(셀 1�
 셀 단위 조작: `cutPaste`(잘라내기), `insertCells`/`deleteCells`(부분 범위만 시프트, 행/열 통째 아님)
 그룹 접기/펼치기: `collapseGroup`, `expandGroup`
 기타: `randomize`(행 순서 섞기), `setLocale`(로케일/시간대), `tabs`, `metadata`, `batchUpdate`
+Drive 파일 관리(2026-07-31 추가, #20 참고): `list`, `create`, `trashSpreadsheet`, `exportCsv`, `exportXlsx`
 
-총 80개 명령. 전부 `1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`(실험실 스프레드시트)에서 실행 →
+총 85개 명령. 아래 80개는 전부 `1b5T1LgILmBZLl4QPuLb66ASqj6EG03fQVy39WMCBVlA`(실험실 스프레드시트)에서 실행 →
 `get`/`metadata`로 반영 확인 → 테스트 흔적 정리(clear/delete/원복) 순서로 검증했다. 이 과정에서
 실제로 잡은 버그 3개: `setGridlines`의 잘못된 필드명(#15), `updateDimensionGroup`의 `depth` 누락(#17),
 `parseRange`의 순수 행 범위 미지원(#14).

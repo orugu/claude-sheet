@@ -102,6 +102,13 @@
 //   node sheets.js randomize <spreadsheetId> <range>            행 순서 무작위로 섞기
 //   node sheets.js setLocale <spreadsheetId> <locale> [timeZone]   예: setLocale id ko_KR Asia/Seoul
 //
+// --- Drive 파일 관리 (drive 스코프 필요, auth.js 재인증 후 사용 가능) ---
+//   node sheets.js list                                내 Drive의 스프레드시트 목록(최근 수정순 50개)
+//   node sheets.js create "제목"                       새 스프레드시트 생성
+//   node sheets.js trashSpreadsheet <spreadsheetId>     휴지통으로 이동(완전삭제 아님)
+//   node sheets.js exportCsv <spreadsheetId> <outPath>  CSV로 내보내기 (첫 번째 시트만, Drive API 제약)
+//   node sheets.js exportXlsx <spreadsheetId> <outPath> xlsx로 내보내기 (전체 시트 포함)
+
 // --- 자기 자신 업데이트 (Google 인증 없이 동작, git pull 기반) ---
 //   node sheets.js --check-update   원격(origin/main) 대비 몇 커밋 뒤처졌는지 확인만(pull 안 함)
 //   node sheets.js --update         위 확인 후 실제 git pull. 커밋 안 된 로컬 변경 있으면 중단.
@@ -126,6 +133,34 @@ const TOKEN_PATH = path.join(__dirname, "token.json");
 function fail(msg) {
   console.error("오류:", msg);
   process.exit(1);
+}
+
+// 자주 겪는 Google API 에러를 한국어 안내 메시지로 감싼다. 판단 못 하면 null 반환해서
+// 호출부가 원본 API 에러 JSON을 그대로 보여주도록 폴백한다(claude-slides-cli와 동일 패턴).
+function friendlyApiError(data) {
+  try {
+    const err = (data && data.error) || {};
+    const status = err.status || "";
+    const message = err.message || "";
+    const reasons = (err.errors || []).map((e) => e.reason || "").join(",");
+
+    if (
+      message.includes("SERVICE_DISABLED") ||
+      reasons.includes("SERVICE_DISABLED") ||
+      message.includes("has not been used in project")
+    ) {
+      return "Google Cloud Console에서 Sheets API/Drive API가 활성화 안 되어 있는 것 같습니다. 콘솔에서 두 API를 모두 활성화하고 몇 분 기다린 후 다시 시도하세요.";
+    }
+    if (err.code === 404 || status === "NOT_FOUND") {
+      return "spreadsheetId가 잘못됐거나 존재하지 않는 것 같습니다. URL 중간의 ID를 정확히 복사했는지 확인하세요.";
+    }
+    if (err.code === 403 || status === "PERMISSION_DENIED") {
+      return "이 스프레드시트에 대한 접근 권한이 없는 것 같습니다. 로그인한 계정에 공유되어 있는지, drive 스코프로 재인증했는지 확인하세요.";
+    }
+  } catch (e) {
+    // 판단 로직 자체가 실패하면 그냥 폴백
+  }
+  return null;
 }
 
 // JSON.parse를 try/catch 없이 그대로 쓰던 명령들(batchGet/update/append/appendRow/sort/
@@ -180,7 +215,7 @@ function cmdUpdate() {
   console.log(`업데이트 완료 (${remote.slice(0, 7)}).`);
 }
 
-function getClient() {
+function getAuthClient() {
   if (!fs.existsSync(CONFIG_PATH)) fail("config.json 없음 — config.example.json 참고해서 만들어주세요.");
   if (!fs.existsSync(TOKEN_PATH)) fail("token.json 없음 — 먼저 `node auth.js` 실행해서 인증하세요.");
 
@@ -195,7 +230,15 @@ function getClient() {
     fs.writeFileSync(TOKEN_PATH, JSON.stringify(merged, null, 2), { mode: 0o600 });
   });
 
-  return google.sheets({ version: "v4", auth: oAuth2Client });
+  return oAuth2Client;
+}
+
+function getClient() {
+  return google.sheets({ version: "v4", auth: getAuthClient() });
+}
+
+function getDriveClient() {
+  return google.drive({ version: "v3", auth: getAuthClient() });
 }
 
 function printResult(dataOrObj) {
@@ -1636,12 +1679,7 @@ async function main() {
         fail(
           '사용법: merge <spreadsheetId> <rangesJSON> [--mergeType=MERGE_ALL|MERGE_COLUMNS|MERGE_ROWS]  예: merge id \'["Sheet1!B1:D1","Sheet1!F1:I1"]\''
         );
-      let rangeList;
-      try {
-        rangeList = JSON.parse(rangesJson);
-      } catch {
-        fail('rangesJSON 파싱 실패 — 예: \'["Sheet1!B1:D1","Sheet1!F1:I1"]\'');
-      }
+      const rangeList = parseJsonArg(rangesJson, '\'["Sheet1!B1:D1","Sheet1!F1:I1"]\'');
       if (!Array.isArray(rangeList)) fail("rangesJSON은 문자열 배열이어야 함");
       const res = await mergeCells(sheets, spreadsheetId, rangeList, mergeType);
       printResult(res);
@@ -2325,6 +2363,68 @@ async function main() {
       break;
     }
 
+    case "list": {
+      const drive = getDriveClient();
+      const res = await drive.files.list({
+        q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+        fields: "files(id,name,modifiedTime,webViewLink)",
+        orderBy: "modifiedTime desc",
+        pageSize: 50,
+      });
+      printResult(res.data.files || []);
+      break;
+    }
+
+    case "create": {
+      const [title] = rest;
+      if (!title) fail('사용법: create "제목"');
+      const res = await sheets.spreadsheets.create({ requestBody: { properties: { title } } });
+      printResult({
+        spreadsheetId: res.data.spreadsheetId,
+        title: res.data.properties?.title,
+        url: res.data.spreadsheetUrl,
+      });
+      break;
+    }
+
+    case "trashSpreadsheet": {
+      const [spreadsheetId] = rest;
+      if (!spreadsheetId) fail("사용법: trashSpreadsheet <spreadsheetId>  (완전삭제 아님, 휴지통으로 이동)");
+      const drive = getDriveClient();
+      await drive.files.update({ fileId: spreadsheetId, requestBody: { trashed: true } });
+      printResult({ trashed: spreadsheetId });
+      break;
+    }
+
+    case "exportCsv": {
+      const [spreadsheetId, outPath] = rest;
+      if (!spreadsheetId || !outPath)
+        fail(
+          "사용법: exportCsv <spreadsheetId> <outPath>  (주의: Drive API 제약으로 첫 번째 시트만 CSV로 내보내짐, 전체 시트가 필요하면 exportXlsx 사용)"
+        );
+      const drive = getDriveClient();
+      const res = await drive.files.export(
+        { fileId: spreadsheetId, mimeType: "text/csv" },
+        { responseType: "arraybuffer" }
+      );
+      fs.writeFileSync(outPath, Buffer.from(res.data));
+      printResult({ exported: outPath, bytes: Buffer.byteLength(fs.readFileSync(outPath)) });
+      break;
+    }
+
+    case "exportXlsx": {
+      const [spreadsheetId, outPath] = rest;
+      if (!spreadsheetId || !outPath) fail("사용법: exportXlsx <spreadsheetId> <outPath>  (전체 시트를 xlsx 워크북 하나로 내보냄)");
+      const drive = getDriveClient();
+      const res = await drive.files.export(
+        { fileId: spreadsheetId, mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+        { responseType: "arraybuffer" }
+      );
+      fs.writeFileSync(outPath, Buffer.from(res.data));
+      printResult({ exported: outPath, bytes: Buffer.byteLength(fs.readFileSync(outPath)) });
+      break;
+    }
+
     default:
       console.log(`알 수 없는 명령: ${cmd}
 사용 가능: tabs, get, batchGet, update, append, appendRow, copyFormat, merge, autoFit, setWidth, wrap, fitWrap,
@@ -2337,12 +2437,15 @@ async function main() {
   addFilterView, deleteFilterView, duplicateFilterView, addMetadata, findMetadata, deleteMetadata,
   trimWhitespace, deleteDuplicates, autoFillRange,
   cutPaste, insertCells, deleteCells, collapseGroup, expandGroup, randomize, setLocale,
-  clear, metadata, batchUpdate, --check-update, --update
+  clear, metadata, batchUpdate, list, create, trashSpreadsheet, exportCsv, exportXlsx,
+  --check-update, --update
 자세한 사용법은 sheets.js 상단 주석 참고.`);
       process.exit(1);
   }
 }
 
 main().catch((err) => {
-  fail(err.response?.data ? JSON.stringify(err.response.data) : err.message);
+  const data = err.response?.data;
+  const friendly = data ? friendlyApiError(data) : null;
+  fail(friendly || (data ? JSON.stringify(data) : err.message));
 });
