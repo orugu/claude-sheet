@@ -123,6 +123,17 @@ function fail(msg) {
   process.exit(1);
 }
 
+// JSON.parse를 try/catch 없이 그대로 쓰던 명령들(batchGet/update/append/appendRow/sort/
+// validate/addPivot/batchUpdate)이 깨진 JSON을 받으면 원본 JS 에러("Unexpected token...")를
+// 그대로 노출했다(실측 확인) - merge 명령이 이미 쓰던 "파싱 실패 — 예: ..." 스타일로 통일.
+function parseJsonArg(json, exampleHint) {
+  try {
+    return JSON.parse(json);
+  } catch {
+    fail(`JSON 파싱 실패${exampleHint ? ` — 예: ${exampleHint}` : ""} (받은 값: ${json})`);
+  }
+}
+
 function getClient() {
   if (!fs.existsSync(CONFIG_PATH)) fail("config.json 없음 — config.example.json 참고해서 만들어주세요.");
   if (!fs.existsSync(TOKEN_PATH)) fail("token.json 없음 — 먼저 `node auth.js` 실행해서 인증하세요.");
@@ -889,6 +900,9 @@ async function copySheetTo(sheets, spreadsheetId, sheetName, destSpreadsheetId) 
     sheetId,
     requestBody: { destinationSpreadsheetId: destSpreadsheetId },
   });
+  // 대상(destSpreadsheetId) 쪽에 새 시트가 생기므로 그 스프레드시트의 캐시를 무효화해야 함
+  // (원본 spreadsheetId는 시트 목록이 안 바뀌니 그대로 둔다).
+  invalidateSheetIdCache(destSpreadsheetId);
   return res.data;
 }
 
@@ -1325,9 +1339,21 @@ async function guardArrayFormulaCollision(sheets, spreadsheetId, range, force, p
   if (formulaCols.size === 0) return;
 
   const hit = [];
-  for (let c = startCol; c <= endCol; c++) {
-    if (formulaCols.has(c) && (!startRow || startRow > formulaCols.get(c).row)) {
-      hit.push({ col: indexToColLetter(c), ...formulaCols.get(c) });
+  if (startCol === null || endCol === null) {
+    // 순수 행 범위("5:5" 같은, 열 지정이 없는 range) - startCol/endCol이 null이라
+    // 고정폭 for 루프(`c <= endCol`)를 돌리면 null이 0으로 강제형변환되어 A열(인덱스 0)
+    // 딱 하나만 검사하고 끝나버리는 버그가 있었다(실측 확인). 열 범위가 없는 거니까
+    // 감지된 ARRAYFORMULA 열 전부를 대상으로 검사한다.
+    for (const [c, info] of formulaCols) {
+      if (!startRow || startRow > info.row) {
+        hit.push({ col: indexToColLetter(c), ...info });
+      }
+    }
+  } else {
+    for (let c = startCol; c <= endCol; c++) {
+      if (formulaCols.has(c) && (!startRow || startRow > formulaCols.get(c).row)) {
+        hit.push({ col: indexToColLetter(c), ...formulaCols.get(c) });
+      }
     }
   }
   if (hit.length === 0) return;
@@ -1434,9 +1460,15 @@ async function main() {
     "--minColor=", "--midColor=", "--maxColor=", "--formula=", "--backgroundColor=",
     "--color=", "--style=", "--sheetTarget=", "--range=", "--visibility=",
   ];
-  const args = rawArgs.filter(
-    (a) => !KNOWN_FLAGS.includes(a) && !KNOWN_PREFIXES.some((p) => a.startsWith(p))
-  );
+  // 알려진 플래그를 rawArgs 전체에서 무조건 걸러내면, findReplace의 찾을값처럼 사용자가
+  // 넘긴 실제 데이터가 우연히 "--force" 같은 플래그 패턴과 겹칠 때 플래그로 오인돼서
+  // 위치인자가 통째로 밀리는 문제가 있었다(실측 확인 가능). 이 CLI의 모든 사용법이
+  // "명령 <위치인자...> [--플래그...]" 식으로 플래그를 항상 맨 뒤에 붙이는 관례라서,
+  // 끝에서부터 훑다가 플래그가 아닌 첫 인자를 만나면 그 앞쪽은 위치인자로 보고 그대로 둔다.
+  const isKnownFlag = (a) => KNOWN_FLAGS.includes(a) || KNOWN_PREFIXES.some((p) => a.startsWith(p));
+  let argsEnd = rawArgs.length;
+  while (argsEnd > 0 && isKnownFlag(rawArgs[argsEnd - 1])) argsEnd--;
+  const args = rawArgs.slice(0, argsEnd);
   const [cmd, ...rest] = args;
   const sheets = getClient();
 
@@ -1470,7 +1502,7 @@ async function main() {
     case "batchGet": {
       const [spreadsheetId, rangesJson] = rest;
       if (!spreadsheetId || !rangesJson) fail("사용법: batchGet <spreadsheetId> <rangesJSON>");
-      const ranges = JSON.parse(rangesJson);
+      const ranges = parseJsonArg(rangesJson, '\'["Sheet1!A1:B2","Sheet2!A1:B2"]\'');
       const res = await sheets.spreadsheets.values.batchGet({
         spreadsheetId,
         ranges,
@@ -1483,7 +1515,7 @@ async function main() {
     case "update": {
       const [spreadsheetId, range, valuesJson] = rest;
       if (!spreadsheetId || !range || !valuesJson) fail("사용법: update <spreadsheetId> <range> <valuesJSON> [--force]");
-      const values = JSON.parse(valuesJson);
+      const values = parseJsonArg(valuesJson, '\'[["a","b"],["c","d"]]\'');
       await guardArrayFormulaCollision(sheets, spreadsheetId, range, force);
       const res = await sheets.spreadsheets.values.update({
         spreadsheetId,
@@ -1499,7 +1531,7 @@ async function main() {
       const [spreadsheetId, range, valuesJson] = rest;
       if (!spreadsheetId || !range || !valuesJson) fail("사용법: append <spreadsheetId> <range> <valuesJSON> [--force]");
       console.error("참고: append는 Sheets API의 '표 인식' 방식이라 빈 칸이 섞여 있으면 예상 밖 위치에 써질 수 있어요. 정확한 위치가 중요하면 appendRow를 쓰세요.");
-      const values = JSON.parse(valuesJson);
+      const values = parseJsonArg(valuesJson, '\'[["a","b"],["c","d"]]\'');
       await guardArrayFormulaCollision(sheets, spreadsheetId, range, force);
       const res = await sheets.spreadsheets.values.append({
         spreadsheetId,
@@ -1517,7 +1549,7 @@ async function main() {
         fail(
           '사용법: appendRow <spreadsheetId> "SheetName" <키열문자예:C> <valuesJSON — 2차원, 1행> [--force] [--formatFrom=행번호] [--noFormat] [--startCol=열문자]'
         );
-      const values = JSON.parse(valuesJson);
+      const values = parseJsonArg(valuesJson, '\'[["a","b","c"]]\'');
       if (!Array.isArray(values) || !Array.isArray(values[0]))
         fail("valuesJSON은 2차원 배열이어야 함, 예: [[\"a\",\"b\",\"c\"]]");
       const out = await appendRowSafe(
@@ -1690,7 +1722,7 @@ async function main() {
         fail(
           '사용법: sort <spreadsheetId> "Sheet1!A2:F6" <sortSpecJSON>  헤더 제외한 범위. 예: \'[{"col":"D","order":"DESC"}]\''
         );
-      const sortSpecs = JSON.parse(sortSpecJson);
+      const sortSpecs = parseJsonArg(sortSpecJson, '\'[{"col":"D","order":"DESC"}]\'');
       const res = await sortRange(sheets, spreadsheetId, range, sortSpecs);
       printResult(res);
       break;
@@ -1702,7 +1734,7 @@ async function main() {
         fail(
           '사용법: validate <spreadsheetId> "Sheet1!D2:D100" <valuesJSON> [--noStrict] [--noDropdown]  예: validate id "Sheet1!D2:D100" \'["대기","진행중","완료"]\''
         );
-      const listValues = JSON.parse(listJson);
+      const listValues = parseJsonArg(listJson, '\'["대기","진행중","완료"]\'');
       const res = await setValidation(sheets, spreadsheetId, range, listValues, { strict, showDropdown });
       printResult(res);
       break;
@@ -1847,9 +1879,9 @@ async function main() {
           '사용법: addPivot <spreadsheetId> <sourceRange(헤더포함)> <대상시트> <앵커셀예:H1> <rowsJSON> <valuesJSON> [colsJSON]\n' +
             '  예: addPivot id "Sheet1!A1:F6" Sheet1 H1 \'[{"col":"C"}]\' \'[{"col":"D","fn":"COUNTA"}]\''
         );
-      const rowsSpec = JSON.parse(rowsJson);
-      const valuesSpec = JSON.parse(valuesJson);
-      const colsSpec = colsJson ? JSON.parse(colsJson) : [];
+      const rowsSpec = parseJsonArg(rowsJson, '\'[{"col":"C"}]\'');
+      const valuesSpec = parseJsonArg(valuesJson, '\'[{"col":"D","fn":"COUNTA"}]\'');
+      const colsSpec = colsJson ? parseJsonArg(colsJson, '\'[{"col":"E"}]\'') : [];
       const res = await addPivotTable(sheets, spreadsheetId, sourceRange, anchorSheetName, anchorCell, rowsSpec, valuesSpec, colsSpec);
       printResult(res);
       break;
@@ -2127,7 +2159,7 @@ async function main() {
     case "deleteDuplicates": {
       const [spreadsheetId, range, colsJson] = rest;
       if (!spreadsheetId || !range) fail('사용법: deleteDuplicates <spreadsheetId> <range> [비교열JSON예:\'["B","C"]\']');
-      const compareCols = colsJson ? JSON.parse(colsJson) : [];
+      const compareCols = colsJson ? parseJsonArg(colsJson, '\'["B","C"]\'') : [];
       const res = await deleteDuplicateRows(sheets, spreadsheetId, range, compareCols);
       printResult(res);
       break;
@@ -2233,7 +2265,7 @@ async function main() {
     case "batchUpdate": {
       const [spreadsheetId, requestsJson] = rest;
       if (!spreadsheetId || !requestsJson) fail("사용법: batchUpdate <spreadsheetId> <requestsJSON>");
-      const requests = JSON.parse(requestsJson);
+      const requests = parseJsonArg(requestsJson, '\'[{"updateCells": {...}}]\'');
       const res = await sheets.spreadsheets.batchUpdate({
         spreadsheetId,
         requestBody: { requests },
